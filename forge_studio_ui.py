@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+forge_studio_ui.py
+==================
+UI für:
+A) Element-Bewertung (klassisch + Quantum/VQE)
+B) Material-Synthese (Evolution) mit *echter* Myzel-Guidance
+   + optionaler VQE-Einbindung in die Fitness (Top-Eliten pro Generation)
+
+Start:
+  streamlit run forge_studio_ui.py
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+import warnings
+from typing import Dict, List
+
+warnings.filterwarnings("ignore", message=r".*multiple allotropes.*", category=UserWarning)
+
+import forge_backend as forge
+
+
+# -------------------------------------------------------------------
+# Konstante Listen: „freundliche“ Properties je Kontext
+# (Schlüssel = Backend-Name, Label = UI-Name)
+# -------------------------------------------------------------------
+ELEMENT_PROPS: Dict[str, str] = {
+    "density": "Dichte (density)",
+    "melting_point": "Schmelzpunkt (melting_point)",
+    "boiling_point": "Siedepunkt (boiling_point)",
+    "atomic_weight": "Atomgewicht (atomic_weight)",
+    "electronegativity_pauling": "Elektronegativität (Pauling)",
+    "vdw_radius": "van-der-Waals-Radius (vdw_radius)",
+    "covalent_radius": "Kovalenzradius (covalent_radius)",
+    "ionization_energy": "Ionisationsenergie (1. Stufe)",
+}
+
+MATERIAL_PROPS: Dict[str, str] = {
+    # Wichtig: Keys müssen zu forge_backend passen (score/search)
+    "bandgap": "Bandlücke (bandgap)",
+    "formation_energy": "Bildungsenergie/Atom (formation_energy)",
+    "density": "Dichte (density)",
+    # Du kannst hier weitere Ziele ergänzen, wenn dein Datensatz sie hat:
+    # "bulk_modulus": "Bulkmodul (bulk_modulus)",
+    # "shear_modulus": "Schermodul (shear_modulus)",
+}
+
+
+# -------------------------------------------------------------------
+# Ziel-Builder: klickbare Auswahl + Gewichte
+#   - available: Dict[key->label]
+#   - state_key: eindeutiger Schlüssel für st.session_state
+#   - presets: Liste von Presets (Name -> Dict[key->weight])
+# Rückgabe: Dict[str, float] (objective->weight)
+# -------------------------------------------------------------------
+def objective_builder(
+    title: str,
+    available: Dict[str, str],
+    *,
+    state_key: str,
+    presets: Dict[str, Dict[str, float]] | None = None,
+) -> Dict[str, float]:
+    # Session-Initialisierung
+    if state_key not in st.session_state:
+        st.session_state[state_key] = {}  # {prop_key: weight}
+
+    # Presets
+    if presets:
+        cols = st.columns(min(4, len(presets)))
+        for i, (pname, pobj) in enumerate(presets.items()):
+            if cols[i % len(cols)].button(f"Preset: {pname}", use_container_width=True):
+                # Ersetzt aktuelle Auswahl mit dem Preset
+                st.session_state[state_key] = dict(pobj)
+
+    # Multiselect der verfügbaren Eigenschaften
+    current_keys: List[str] = list(st.session_state[state_key].keys())
+    selected = st.multiselect(
+        "Ziele auswählen",
+        options=list(available.keys()),
+        format_func=lambda k: available[k],
+        default=current_keys or None,
+        help=(
+            "Wähle die Eigenschaften aus, die optimiert/bewertet werden sollen. "
+            "Positive Gewichte bedeuten 'maximieren', negative 'minimieren'."
+        ),
+    )
+
+    # Entfernte Keys aus dem State räumen
+    for k in list(st.session_state[state_key].keys()):
+        if k not in selected:
+            st.session_state[state_key].pop(k, None)
+
+    # Für neu ausgewählte Keys Standardgewicht setzen
+    for k in selected:
+        if k not in st.session_state[state_key]:
+            # Heuristik: bei bekannten Minimierungszielen negativ starten
+            default_w = -1.0 if k in {"formation_energy"} else 1.0
+            st.session_state[state_key][k] = float(default_w)
+
+    # Für jede ausgewählte Eigenschaft Gewicht eingeben lassen
+    if selected:
+        st.markdown("**Gewichte je Ziel**  \n(>0 = maximieren, <0 = minimieren; Mischung möglich)")
+        for k in selected:
+            label = available[k]
+            cols = st.columns([2, 2, 1])
+            with cols[0]:
+                st.write(f"• {label}")
+            with cols[1]:
+                w = st.number_input(
+                    "Gewicht",
+                    key=f"{state_key}_w_{k}",
+                    value=float(st.session_state[state_key][k]),
+                    step=0.1,
+                    format="%.2f",
+                    help="Beispiele: 1.0 (stark maximieren), -0.5 (leicht minimieren), 0.0 (neutral)",
+                )
+                st.session_state[state_key][k] = float(w)
+            with cols[2]:
+                if st.button("➖ Entfernen", key=f"{state_key}_rm_{k}"):
+                    st.session_state[state_key].pop(k, None)
+                    st.experimental_rerun()
+    else:
+        st.info("Noch keine Ziele gewählt. Bitte oben Eigenschaften hinzufügen.")
+
+    return dict(st.session_state[state_key])
+
+
+# -------------------------------------------------------------------
+# Layout
+# -------------------------------------------------------------------
+st.set_page_config(page_title="Forge Studio", layout="wide")
+st.title("🌌 Forge Studio: Elements & Materials")
+st.caption("GPU-beschleunigt via CipherCore DLL mit Myzel- & VQE-Fitness")
+
+with st.sidebar:
+    st.header("⚙️ Globale Einstellungen")
+    dll_path = st.text_input("DLL-Pfad", value=forge.autodetect_dll())
+    gpu_index = st.number_input("GPU-Index", min_value=0, value=0, step=1)
+
+tabA, tabB = st.tabs(["A) Elemente bewerten", "B) Neues Material entwerfen"])
+
+
+# ===================================================================
+# TAB A – Elemente
+# ===================================================================
+with tabA:
+    st.header("A) Bewertung realer Elemente")
+    st.markdown(
+        "Wähle die **Eigenschaften** und setze **Gewichte**: "
+        "_positiv = maximieren_, _negativ = minimieren_."
+    )
+
+    # Presets für Elemente
+    element_presets = {
+        "Leicht & schmelzstark": {"density": -1.0, "melting_point": 1.0},
+        "Reaktiv & leicht": {"electronegativity_pauling": 1.0, "density": -0.5},
+        "Hitzebeständig": {"melting_point": 1.0, "boiling_point": 0.5},
+    }
+
+    objectives_A = objective_builder(
+        "Ziele (Eigenschaft: Gewicht)",
+        ELEMENT_PROPS,
+        state_key="obj_builder_A",
+        presets=element_presets,
+    )
+
+    mode_A = st.radio(
+        "Berechnungsmodus",
+        ["Klassisch (Einzigartigkeit)", "Quantum (VQE)"],
+        horizontal=True,
+        key="mode_A",
+    )
+
+    if "Klassisch" in mode_A:
+        uniq_w = st.slider("Gewichtung Einzigartigkeit (α)", 0.0, 1.0, 0.3, 0.05, key="uniq_w")
+    else:
+        c1, c2 = st.columns(2)
+        with c1:
+            quant_w = st.slider("Gewichtung Quantum-Score (β)", 0.0, 1.0, 0.5, 0.05, key="quant_w")
+        with c2:
+            qbits = st.number_input("Qubits (VQE)", min_value=2, max_value=16, value=4, step=1, key="qbits_A")
+
+    if st.button("🚀 Elemente bewerten", type="primary"):
+        if not objectives_A:
+            st.error("Bitte mindestens ein Ziel definieren.")
+        else:
+            mode_key = "quantum" if "Quantum" in mode_A else "classic"
+            with st.spinner(f"Bewertung läuft ({mode_key}) …"):
+                try:
+                    dfA = forge.score_elements(
+                        dll_path=dll_path,
+                        gpu_index=int(gpu_index),
+                        mode=mode_key,
+                        objectives=objectives_A,
+                        uniqueness_weight=uniq_w if mode_key == "classic" else 0.3,
+                        quantum_weight=quant_w if mode_key == "quantum" else 0.5,
+                        num_qubits=qbits if mode_key == "quantum" else 4,
+                    )
+                    st.session_state["df_elements"] = dfA
+                    st.success("Bewertung abgeschlossen.")
+                except Exception as e:
+                    st.exception(e)
+
+    if "df_elements" in st.session_state:
+        st.subheader("Rangliste")
+        st.dataframe(st.session_state["df_elements"], use_container_width=True)
+        st.download_button(
+            "⤓ CSV exportieren",
+            data=st.session_state["df_elements"].to_csv(index=False).encode("utf-8"),
+            file_name="element_scores.csv",
+            mime="text/csv",
+        )
+
+
+# ===================================================================
+# TAB B – Material-Synthese (Myzel + VQE)
+# ===================================================================
+with tabB:
+    st.header("B) Evolutionäre Material-Synthese (Myzel + VQE-Fitness optional)")
+    st.markdown(
+        "Wähle **Materialziele** (Datensatzabhängig). "
+        "Gewichte: _positiv = maximieren_, _negativ = minimieren_."
+    )
+
+    # Presets für Materialien
+    material_presets = {
+        "Halbleiter-Fokus": {"bandgap": 1.0, "formation_energy": -1.0, "density": 0.3},
+        "Strukturell leicht": {"density": -1.0, "formation_energy": -0.5},
+        "Energie-stabil": {"formation_energy": -1.0},
+    }
+
+    objectives_B = objective_builder(
+        "Ziele (Eigenschaft: Gewicht)",
+        MATERIAL_PROPS,
+        state_key="obj_builder_B",
+        presets=material_presets,
+    )
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        dataset_B = st.text_input("JARVIS-Datensatz", "dft_3d")
+    with c2:
+        pop_B = st.number_input("Population", min_value=32, max_value=1024, value=128, step=16)
+    with c3:
+        steps_B = st.number_input("Generationen", min_value=10, max_value=1000, value=50, step=10)
+
+    c4, c5, c6 = st.columns(3)
+    with c4:
+        vocab_B = st.number_input("Vokabulargröße", min_value=16, max_value=128, value=32, step=4)
+    with c5:
+        max_elems_B = st.number_input("Max. Elemente / Formel", min_value=2, max_value=8, value=4, step=1)
+    with c6:
+        qbits_B = st.number_input("Qubits (Platzhalter für spätere tiefe VQE-Scorer)", min_value=2, max_value=16, value=5, step=1)
+
+    st.markdown("---")
+    st.subheader("🧠 Myzel-Parameter")
+    use_mycel = st.checkbox("Myzel-Guidance aktivieren (CipherCore)", value=True)
+    c7, c8, c9 = st.columns(3)
+    with c7:
+        guidance = st.slider("Guidance-Stärke", 0.0, 1.0, 0.3, 0.05)
+    with c8:
+        decay = st.slider("Zerfall (Decay)", 0.0, 0.2, 0.05, 0.01)
+    with c9:
+        diffusion = st.slider("Diffusion", 0.0, 0.1, 0.02, 0.01)
+
+    c10, c11 = st.columns(2)
+    with c10:
+        k_neighbors = st.number_input("k-Nachbarn (Topologie)", min_value=1, max_value=8, value=4, step=1)
+    with c11:
+        topk_bias = st.number_input("Top-k Bias (Pheromon Fokus, 0=aus)", min_value=0, max_value=64, value=0, step=1)
+
+    st.markdown("---")
+    st.subheader("🧪 VQE direkt in die Fitness einmischen (GPU)")
+    use_vqe_fit = st.checkbox("VQE-Fitness aktivieren", value=True)
+    c12, c13, c14, c15 = st.columns(4)
+    with c12:
+        vqe_weight = st.slider("VQE-Gewicht γ", 0.0, 1.0, 0.35, 0.05)
+    with c13:
+        vqe_elite_k = st.number_input("Top-K Eliten für VQE", min_value=1, max_value=64, value=8, step=1)
+    with c14:
+        vqe_qubits = st.number_input("VQE Qubits", min_value=2, max_value=16, value=6, step=1)
+    with c15:
+        vqe_layers = st.number_input("VQE Layers", min_value=1, max_value=6, value=2, step=1)
+
+    if st.button("🧬 Synthese starten", type="primary", key="run_b"):
+        if not objectives_B:
+            st.error("Bitte mindestens ein Ziel definieren.")
+        else:
+            with st.spinner("Evolution startet …"):
+                try:
+                    if use_mycel:
+                        formulas, table, meta = forge.mycelial_quantum_evolution(
+                            dll_path=dll_path, gpu_index=int(gpu_index),
+                            dataset=dataset_B,
+                            objectives=list(objectives_B.keys()),
+                            weights=list(objectives_B.values()),
+                            population=int(pop_B), steps=int(steps_B),
+                            vocab_size=int(vocab_B), max_elements=int(max_elems_B), num_qubits=int(qbits_B),
+                            mycel_guidance_strength=float(guidance),
+                            mycel_decay=float(decay),
+                            mycel_diffusion=float(diffusion),
+                            mycel_k_neighbors=int(k_neighbors),
+                            mycel_topk_bias=(int(topk_bias) if topk_bias > 0 else None),
+                            use_vqe_fitness=bool(use_vqe_fit),
+                            vqe_weight=float(vqe_weight),
+                            vqe_elite_k=int(vqe_elite_k),
+                            vqe_num_qubits=int(vqe_qubits),
+                            vqe_layers=int(vqe_layers),
+                        )
+                    else:
+                        formulas, table, meta = forge.search_new_material(
+                            dll_path=dll_path, gpu_index=int(gpu_index),
+                            dataset=dataset_B,
+                            objectives=list(objectives_B.keys()),
+                            weights=list(objectives_B.values()),
+                            population=int(pop_B), steps=int(steps_B),
+                            vocab_size=int(vocab_B), max_elements=int(max_elems_B), num_qubits=int(qbits_B),
+                        )
+                    st.session_state["df_materials"] = table
+                    st.session_state["meta_materials"] = meta
+                    st.success("Synthese abgeschlossen.")
+                except ImportError as e:
+                    st.error(f"Fehlendes Paket: {e}. (Tipp: pip install jarvis-tools)")
+                except Exception as e:
+                    st.exception(e)
+
+    if "df_materials" in st.session_state:
+        st.subheader("Vorschläge")
+        st.dataframe(st.session_state["df_materials"], use_container_width=True)
+        st.download_button(
+            "⤓ CSV exportieren",
+            data=st.session_state["df_materials"].to_csv(index=False).encode("utf-8"),
+            file_name="material_suggestions.csv",
+            mime="text/csv",
+        )
+
+        meta = st.session_state.get("meta_materials", {})
+        if "pheromone_history" in meta and meta["pheromone_history"]:
+            st.subheader("🧪 Myzel – mittlere Pheromonstärke")
+            ph = pd.Series(meta["pheromone_history"], name="pher_mean")
+            st.line_chart(ph)
+            st.caption("Anstieg deutet auf erfolgreiche Lern-/Leiteffekte im Myzel hin.")
+
+        if "vqe_fitness" in meta:
+            vf = meta["vqe_fitness"]
+            st.info(
+                f"VQE-Fitness: {'aktiv' if vf.get('enabled') else 'inaktiv'} • "
+                f"γ={vf.get('weight')} • Top-K={vf.get('elite_k')} • "
+                f"Q={vf.get('num_qubits')} • L={vf.get('layers')} • Cache={vf.get('cache_size')}"
+            )
