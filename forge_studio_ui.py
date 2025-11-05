@@ -17,8 +17,10 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import streamlit as st
+import time
+from datetime import datetime
 import warnings
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 warnings.filterwarnings("ignore", message=r".*multiple allotropes.*", category=UserWarning)
 
@@ -67,7 +69,11 @@ def objective_builder(
     if presets:
         cols = st.columns(min(4, len(presets)))
         for i, (pname, pobj) in enumerate(presets.items()):
-            if cols[i % len(cols)].button(f"Preset: {pname}", use_container_width=True, key=f"{state_key}_preset_{pname}"):
+            if cols[i % len(cols)].button(
+                f"Preset: {pname}",
+                use_container_width=True,
+                key=f"{state_key}_preset_{pname}",
+            ):
                 st.session_state[state_key] = dict(pobj)
 
     # Auswahl
@@ -111,26 +117,54 @@ def objective_builder(
             with cols[2]:
                 if st.button("➖ Entfernen", key=f"{state_key}_rm_{k}"):
                     st.session_state[state_key].pop(k, None)
-                    st.experimental_rerun()
+                    st.rerun()
     else:
         st.info("Noch keine Ziele gewählt. Bitte oben Eigenschaften hinzufügen.")
 
     return dict(st.session_state[state_key])
 
+# --- Zeitformatierer ---
+def _fmt_duration(seconds: float) -> str:
+    """Formatiert Sekunden als HH:MM:SS.mmm (millisekundengenau)."""
+    if seconds is None or not np.isfinite(seconds):
+        return "n/a"
+    ms = int(round((seconds - int(seconds)) * 1000))
+    total = int(seconds)
+    h = total // 3600
+    m = (total % 3600) // 60
+    s = total % 60
+    return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
+
 # -------------------------------------------------------------------
-# Caching-Helfer (beschleunigt Diagnostik-Surrogat)
+# Datenzugriff / Caching – nur hashbare Inputs verwenden!
 # -------------------------------------------------------------------
-@st.cache_data(show_spinner=False)
-def _cached_load_df(dataset: str) -> pd.DataFrame:
+
+def _load_df(dataset: str) -> pd.DataFrame:
+    """Nicht cachen: der Original-DataFrame enthält teils dict-Spalten (nicht hashbar)."""
     return forge.load_jarvis_dataframe(dataset)
 
 @st.cache_data(show_spinner=False)
-def _cached_vocab(df: pd.DataFrame, max_elems: int) -> list[str]:
-    return forge.build_vocab(df, max_elems=max_elems)
+def _cached_vocab_from_formulas(formulas: Tuple[str, ...], max_elems: int) -> list[str]:
+    """
+    Erzeugt das Vokabular nur aus Formeln (hashbar; keine dict-Spalten).
+    """
+    # Minimal-DataFrame bauen, damit wir forge.build_vocab wiederverwenden können
+    df_small = pd.DataFrame({"formula": list(formulas)})
+    return forge.build_vocab(df_small, max_elems=max_elems)
 
 @st.cache_data(show_spinner=False)
-def _cached_surrogates(df: pd.DataFrame, vocab: list[str], obj_list: list[str]) -> dict[str, forge.Surrogate]:
-    return forge.safe_train_surrogate_map(df[["formula"] + obj_list], vocab, obj_list)
+def _cached_surrogates_from_targets(df_targets: pd.DataFrame, vocab: list[str], obj_list: list[str]) -> dict[str, forge.Surrogate]:
+    """
+    Cacht die Surrogate auf einem *schlanken* DataFrame (nur 'formula' + float-Zielspalten).
+    Solche DFs sind hashbar (keine dict-Objekte in Zellen).
+    """
+    # Sicherheitsnetz: nur 'formula' + obj_list behalten, cast auf numerisch
+    cols = ["formula"] + list(obj_list)
+    df_slim = df_targets.loc[:, [c for c in cols if c in df_targets.columns]].copy()
+    for obj in obj_list:
+        if obj in df_slim.columns:
+            df_slim[obj] = pd.to_numeric(df_slim[obj], errors="coerce")
+    return forge.safe_train_surrogate_map(df_slim, vocab, obj_list)
 
 # -------------------------------------------------------------------
 # Layout
@@ -198,7 +232,7 @@ with tabA:
 
     if "df_elements" in st.session_state:
         st.subheader("Rangliste")
-        st.dataframe(st.session_state["df_elements"], use_container_width=True)
+        st.dataframe(st.session_state["df_elements"], width="stretch")
         st.download_button(
             "⤓ CSV exportieren",
             data=st.session_state["df_elements"].to_csv(index=False).encode("utf-8"),
@@ -236,6 +270,10 @@ with tabB:
     with c6:
         qbits_B = st.number_input("Qubits (Platzhalter für spätere tiefe VQE-Scorer)", min_value=2, max_value=16, value=5, step=1)
 
+    # Persistiere aktuelle Auswahl für Diagnostik
+    st.session_state["dataset_B"] = dataset_B
+    st.session_state["vocab_B"] = int(vocab_B)
+
     st.markdown("---")
     st.subheader("🧠 Myzel-Parameter")
     use_mycel = st.checkbox("Myzel-Guidance aktivieren (CipherCore)", value=True)
@@ -270,9 +308,13 @@ with tabB:
         if not objectives_B:
             st.error("Bitte mindestens ein Ziel definieren.")
         else:
+            # UI-Startzeit (End-to-End)
+            t_ui0 = time.perf_counter()
+
             with st.spinner("Evolution startet …"):
                 try:
                     if use_mycel:
+                        mode_label = "Myzel + (optional) VQE"
                         formulas, table, meta = forge.mycelial_quantum_evolution(
                             dll_path=dll_path, gpu_index=int(gpu_index),
                             dataset=dataset_B,
@@ -292,6 +334,7 @@ with tabB:
                             vqe_layers=int(vqe_layers),
                         )
                     else:
+                        mode_label = "Baseline (ohne Myzel)"
                         formulas, table, meta = forge.search_new_material(
                             dll_path=dll_path, gpu_index=int(gpu_index),
                             dataset=dataset_B,
@@ -300,9 +343,34 @@ with tabB:
                             population=int(pop_B), steps=int(steps_B),
                             vocab_size=int(vocab_B), max_elements=int(max_elems_B), num_qubits=int(qbits_B),
                         )
+
+                    # UI-Endzeit (End-to-End)
+                    t_ui1 = time.perf_counter()
+                    t_ui = t_ui1 - t_ui0
+                    t_backend = float(meta.get("runtime_s", float("nan")))
+
+                    # Ergebnisse in Session-State
                     st.session_state["df_materials"] = table
                     st.session_state["meta_materials"] = meta
+                    st.session_state["last_run_timing"] = {
+                        "mode": mode_label,
+                        "ui_seconds": t_ui,
+                        "backend_seconds": t_backend,
+                        "ui_fmt": _fmt_duration(t_ui),
+                        "backend_fmt": _fmt_duration(t_backend),
+                        "timestamp_end": datetime.now().astimezone().isoformat(timespec="seconds"),
+                    }
+
                     st.success("Synthese abgeschlossen.")
+
+                    # präzise Zeitinfo sofort anzeigen
+                    st.info(
+                        f"⏱️ **Laufzeiten** — Modus: *{mode_label}*\n\n"
+                        f"- End-to-End (UI): **{_fmt_duration(t_ui)}**\n"
+                        f"- Backend-Kern (GA/Myzel/VQE): **{_fmt_duration(t_backend)}**\n"
+                        f"- Fertig um: {st.session_state['last_run_timing']['timestamp_end']}"
+                    )
+
                 except ImportError as e:
                     st.error(f"Fehlendes Paket: {e}. (Tipp: pip install jarvis-tools)")
                 except Exception as e:
@@ -310,7 +378,7 @@ with tabB:
 
     if "df_materials" in st.session_state:
         st.subheader("Vorschläge")
-        st.dataframe(st.session_state["df_materials"], use_container_width=True)
+        st.dataframe(st.session_state["df_materials"], width="stretch")
         st.download_button(
             "⤓ CSV exportieren",
             data=st.session_state["df_materials"].to_csv(index=False).encode("utf-8"),
@@ -338,12 +406,26 @@ with tabB:
 # ===================================================================
 with tabC:
     st.header("C) Diagnostik")
+
+    # Letzte Laufzeit anzeigen
+    last = st.session_state.get("last_run_timing")
+    if last:
+        st.subheader("⏱️ Letzte Laufzeit")
+        st.write(
+            f"- Modus: **{last.get('mode','')}**  \n"
+            f"- End-to-End (UI): **{last.get('ui_fmt','n/a')}**  \n"
+            f"- Backend-Kern (GA/Myzel/VQE): **{last.get('backend_fmt','n/a')}**  \n"
+            f"- Fertig um: {last.get('timestamp_end','')}"
+        )
+    else:
+        st.info("Noch keine Laufzeit erfasst. Starte eine Synthese in Tab B.")
+
     st.markdown(
-        "Hier siehst du **Trainings- und Laufmetriken** (pro Generation) sowie einen **Surrogat-Gesundheitscheck** "
-        "für die aktuell gewählten Materialziele."
+        "Hier siehst du **Trainings- und Laufmetriken** (pro Generation) sowie einen "
+        "**Surrogat-Gesundheitscheck** für die aktuell gewählten Materialziele."
     )
 
-    # --- 1) GA-/Myzel-/VQE-Metriken aus meta['gen_history'] ---
+    # 1) GA-/Myzel-/VQE-Metriken aus meta['gen_history']
     meta = st.session_state.get("meta_materials", {})
     gen_hist = meta.get("gen_history", None)
 
@@ -366,7 +448,7 @@ with tabC:
                 st.info("Noch keine Myzel-/VQE-Metriken verfügbar.")
 
         with st.expander("Rohdaten (gen_history)"):
-            st.dataframe(gh, use_container_width=True, height=320)
+            st.dataframe(gh, width="stretch", height=320)
             st.download_button(
                 "⤓ gen_history.csv",
                 data=gh.to_csv(index=False).encode("utf-8"),
@@ -378,27 +460,32 @@ with tabC:
 
     st.markdown("---")
 
-    # --- 2) Surrogat-Gesundheitscheck ---
+    # 2) Surrogat-Gesundheitscheck
     st.subheader("🩺 Surrogat-Gesundheitscheck (aktueller Datensatz & Ziele)")
 
-    # Nimmt die aktuellen Einstellungen aus Tab B
-    dataset = st.session_state.get("dataset_B_sel", None) or st.session_state.get("dataset_B", "dft_3d")
-    # falls nicht gesetzt: nimm den im UI-Feld aktuell sichtbaren Default
+    # Aktuelle Einstellungen aus Tab B
+    dataset = st.session_state.get("dataset_B", "dft_3d")
     dataset = dataset if isinstance(dataset, str) else "dft_3d"
-
     objectives_cur = st.session_state.get("obj_builder_B", {})
+
     if not objectives_cur:
         st.info("Keine Materialziele gewählt (Tab B). Wähle Ziele, dann hier aktualisieren.")
     else:
         with st.spinner("Trainiere Surrogate für Diagnostik …"):
             try:
-                df = _cached_load_df(dataset)
-                vocab = _cached_vocab(df, max_elems=int(st.session_state.get("vocab_B", 32) or 32))
-                obj_list = list(objectives_cur.keys())
+                # 2.1 Rohdaten laden (unkached, um dict-Spalten-Hashing zu vermeiden)
+                df = _load_df(dataset)
 
-                # Spaltennamen auf Datensatz abbilden wie im Backend (vereinfachend: direkt probieren)
-                df_targets = df[["formula"]].copy()
-                col_map = {}
+                # 2.2 Nur Formeln für Vokabular extrahieren → tuple (hashbar)
+                formulas_tuple: Tuple[str, ...] = tuple(df["formula"].astype(str).tolist())
+
+                # 2.3 Vokabular cachen (aus Formeln, hashbar)
+                vocab = _cached_vocab_from_formulas(formulas_tuple, max_elems=int(st.session_state.get("vocab_B", 32) or 32))
+
+                # 2.4 Zielspalten sauber abbilden (wie im Backend)
+                obj_list = list(objectives_cur.keys())
+                df_targets = pd.DataFrame({"formula": df["formula"].astype(str)})
+                col_map: Dict[str, str | None] = {}
                 for obj in obj_list:
                     lo = obj.lower()
                     if lo == "bandgap":
@@ -407,20 +494,20 @@ with tabC:
                         col = "formation_energy_peratom" if "formation_energy_peratom" in df.columns else "formation_energy"
                     else:
                         col = obj
-                    if col not in df.columns:
-                        col_map[obj] = None
-                    else:
+                    if col in df.columns:
+                        df_targets[obj] = pd.to_numeric(df[col], errors="coerce")
                         col_map[obj] = col
-                        df_targets[obj] = df[col]
+                    else:
+                        col_map[obj] = None  # fehlt im Datensatz
 
-                # Nur wirklich vorhandene Ziele trainieren
                 trainable = [o for o in obj_list if col_map.get(o)]
                 if not trainable:
                     st.warning("Keine passenden Zielspalten im Datensatz gefunden.")
                 else:
-                    sur_map = forge.safe_train_surrogate_map(df_targets, vocab, trainable)
+                    # 2.5 Surrogate cachen – auf df_targets (schlank & hashbar)
+                    sur_map = _cached_surrogates_from_targets(df_targets[["formula"] + trainable], vocab, trainable)
 
-                    # Kennzahlen je Ziel
+                    # 2.6 Kennzahlen je Ziel
                     rows = []
                     N = len(df_targets)
                     for obj in obj_list:
@@ -458,7 +545,7 @@ with tabC:
                         })
 
                     diag_df = pd.DataFrame(rows)
-                    st.dataframe(diag_df, use_container_width=True, height=280)
+                    st.dataframe(diag_df, width="stretch", height=280)
                     st.download_button(
                         "⤓ surrogate_health.csv",
                         data=diag_df.to_csv(index=False).encode("utf-8"),
