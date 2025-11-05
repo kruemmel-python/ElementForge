@@ -1016,7 +1016,8 @@ def mycelial_quantum_evolution(
         print(f"[Gen {g + 1:02d}] best={np.max(norm_score):.3f}  mean={np.mean(norm_score):.3f}  pher_mean={pher_history_mean[-1]:.6f}")
 
     # Abschluss – Kandidaten & Tabelle
-    final_norm, _, _ = score_candidates(cc, sur_map, pool, obj_list, list(weights or []))
+    _final = score_candidates(cc, sur_map, pool, obj_list, list(weights or []))
+    final_norm = _final[0]
     top_idx = np.argsort(final_norm)[-20:]
 
     candidates: list[np.ndarray] = []
