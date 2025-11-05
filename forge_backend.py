@@ -494,10 +494,17 @@ def gpu_matmul(cc: CipherCore, A: np.ndarray, B: np.ndarray) -> np.ndarray:
     return A.astype(np.float32) @ B.astype(np.float32)
 
 def predict_scalar_gpu(cc: CipherCore, sur: Surrogate, Xfrac: np.ndarray) -> np.ndarray:
+    """Vorhersage y = Xn @ W + b, robust für GPU-Matmul (W als Spaltenvektor)."""
     X = Xfrac.astype(np.float32, copy=False)
     Xn = (X - sur.mu) / sur.sigma
-    out = gpu_matmul(cc, Xn, sur.W) + sur.b
-    return out.ravel().astype(np.float32)
+    W = sur.W.reshape(-1, 1).astype(np.float32)  # <— Spaltenvektor
+    if cc.has_matmul:
+        y = cc.matmul(Xn, W)                      # (N, 1)
+        y = y.reshape(-1)
+    else:
+        y = (Xn @ W).reshape(-1)
+    return (y + sur.b).astype(np.float32)
+
 
 def _renorm_nonneg(v: np.ndarray) -> np.ndarray:
     v = np.clip(v, 0.0, 1.0)
@@ -560,18 +567,26 @@ def _build_knn_neighbors(vocab: list[str], k: int) -> np.ndarray:
 
 # ---- VQE-Fitness-Helfer -----------------------------------------------------
 
-def _props_norm_from_pool_preds(pred_matrix: np.ndarray, obj_list: Sequence[str]) -> list[dict[str, float]]:
+def _props_norm_from_pool_preds(pred_matrix: np.ndarray,
+                                valid_names: Sequence[str]) -> list[dict[str, float]]:
     """
-    pred_matrix: shape (N, M) – Spalten entsprechen obj_list.
-    Rückgabe: N Dictionaries mit normierten Werten je Ziel.
+    pred_matrix: (N, M_valid), Spaltennamen = valid_names
+    Rückgabe: Liste von {name: normierter_wert}
     """
-    props_norm_list: list[dict[str, float]] = []
-    for j in range(pred_matrix.shape[1]):
-        col = normalize01(pred_matrix[:, j])
-        pred_matrix[:, j] = col  # in-place normalisiert
-    for i in range(pred_matrix.shape[0]):
-        props_norm_list.append({obj_list[j]: float(pred_matrix[i, j]) for j in range(pred_matrix.shape[1])})
-    return props_norm_list
+    P = pred_matrix.astype(np.float32, copy=False)
+    # Spaltenweise auf 0..1 normalisieren
+    for j in range(P.shape[1]):
+        col = P[:, j]
+        lo, hi = float(np.nanmin(col)), float(np.nanmax(col))
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            P[:, j] = 0.0
+        else:
+            P[:, j] = (col - lo) / (hi - lo + 1e-8)
+    out: list[dict[str, float]] = []
+    for i in range(P.shape[0]):
+        out.append({valid_names[j]: float(P[i, j]) for j in range(P.shape[1])})
+    return out
+
 
 def _make_terms_from_props(props_norm: dict[str, float], objectives: dict[str, float], num_qubits: int) -> list[PauliZTerm]:
     return _ising_terms_from_objectives(props_norm, objectives, num_qubits)
@@ -586,33 +601,44 @@ def _vec_hash(v: np.ndarray, ndigits: int = 4) -> tuple:
 
 # ---- GA Scoring -------------------------------------------------------------
 
-def score_candidates(cc: CipherCore, sur_map: dict[str, Surrogate], X: np.ndarray,
-                     objectives: Sequence[str], weights: Sequence[float]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Gibt (norm_score 0..1, raw_score, pred_matrix) zurück."""
-    preds = []
+def score_candidates(cc: CipherCore,
+                     sur_map: dict[str, Surrogate],
+                     X: np.ndarray,
+                     objectives: Sequence[str],
+                     weights: Sequence[float]
+                     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
+    """
+    Rückgabe:
+      norm_score (N,), raw_score (N,), pred_matrix P (N,M_valid), valid_names (M_valid)
+    """
+    preds: list[np.ndarray] = []
+    valid_names: list[str] = []
+
     w = np.asarray(weights if weights else np.ones(len(objectives), dtype=np.float32), dtype=np.float32)
     if w.size != len(objectives):
         w = np.ones((len(objectives),), dtype=np.float32)
     w = w / (float(w.sum()) + 1e-8)
 
-    valid_idx = []
+    valid_idx: list[int] = []
     for i, obj in enumerate(objectives):
         if obj not in sur_map:
             continue
-        p = predict_scalar_gpu(cc, sur_map[obj], X)  # kann reell werden, keine NaNs erwartet
+        p = predict_scalar_gpu(cc, sur_map[obj], X)
         if not np.isfinite(p).any():
             continue
-        preds.append(p)
+        preds.append(p.astype(np.float32))
         valid_idx.append(i)
+        valid_names.append(obj)
 
     if not preds:
-        # nichts verwertbar → alles 0
         N = X.shape[0]
-        return np.zeros(N, dtype=np.float32), np.zeros(N, dtype=np.float32), np.zeros((N, 0), dtype=np.float32)
+        return (np.zeros(N, dtype=np.float32),
+                np.zeros(N, dtype=np.float32),
+                np.zeros((N, 0), dtype=np.float32),
+                [])
 
-    P = np.stack(preds, axis=1).astype(np.float32)  # NxM (nur valide Ziele)
+    P = np.stack(preds, axis=1).astype(np.float32)  # (N, M_valid)
 
-    # Gewichte entsprechend valid_idx reduzieren
     w_eff = w[valid_idx]
     w_eff = w_eff / (float(w_eff.sum()) + 1e-8)
 
@@ -622,7 +648,9 @@ def score_candidates(cc: CipherCore, sur_map: dict[str, Surrogate], X: np.ndarra
         norm = np.zeros_like(raw, dtype=np.float32)
     else:
         norm = (raw - lo) / (hi - lo + 1e-8)
-    return norm, raw, P
+
+    return norm, raw, P, valid_names
+
 
 # ---- Basis-Evolution --------------------------------------------------------
 
@@ -886,8 +914,7 @@ def mycelial_quantum_evolution(
     # 5) Schleife
     for g in range(steps):
         # Surrogat-Bewertung
-        norm_score, raw_score, P_pred = score_candidates(cc, sur_map, pool, obj_list, list(weights or []))
-
+        norm_score, raw_score, P_pred, valid_names = score_candidates(cc, sur_map, pool, obj_list, list(weights or []))
         elite_n = max(1, int(round(0.25 * population)))
         elite_idx = np.argsort(norm_score)[-elite_n:]
         elites = pool[elite_idx].copy()
@@ -896,7 +923,7 @@ def mycelial_quantum_evolution(
 
         # 3) Optional: VQE-Fitness in kombinierte Fitness mischen
         if use_vqe_fitness and cc.has_vqe and vqe_weight > 0.0:
-            props_norm_list = _props_norm_from_pool_preds(P_pred.copy(), obj_list)
+            props_norm_list = _props_norm_from_pool_preds(P_pred.copy(), valid_names)
             k_eval = int(max(1, min(vqe_elite_k, elites.shape[0])))
             elite_eval_idx = elite_idx[-k_eval:]
             energies = np.full(pool.shape[0], np.nan, dtype=np.float32)
