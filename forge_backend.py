@@ -903,7 +903,10 @@ def mycelial_quantum_evolution(
 
     gen_history: list[dict] = []
     pher_history_mean: list[float] = []
-    pher_buf = np.zeros((D,), dtype=np.float32)
+
+    # KORREKTUR: Puffer für Kanten-Pheromone erstellen (Größe D * K)
+    pher_edge_buf = np.zeros((D * k,), dtype=np.float32) 
+    pher_node_buf = np.zeros((D,), dtype=np.float32) # Puffer für die berechneten Knoten-Pheromone
 
     global_best_comb = -np.inf
     global_best_vec: np.ndarray | None = None
@@ -972,8 +975,8 @@ def mycelial_quantum_evolution(
 
         # 5) JETZT Pheromon messen (nach Update)
         if 'pher_buf' not in locals():
-            pher_buf = np.zeros((pool.shape[1],), dtype=np.float32)
-        pher = cc.mycel_read(layer=0, out_buf=pher_buf)
+            pher_edges_raw = cc.mycel_read(layer=0, out_buf=pher_edge_buf)
+        pher = pher_edges_raw.reshape((D, k)).sum(axis=1)
         pher_history_mean.append(float(np.mean(pher)))
 
         # 6) Kinder mit Pheromon-Guidance erzeugen

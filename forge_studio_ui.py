@@ -268,7 +268,7 @@ with tabB:
     with c5:
         max_elems_B = st.number_input("Max. Elemente / Formel", min_value=2, max_value=8, value=4, step=1)
     with c6:
-        qbits_B = st.number_input("Qubits (Platzhalter für spätere tiefe VQE-Scorer)", min_value=2, max_value=16, value=5, step=1)
+        qbits_B = st.number_input("Qubits (für VQE-Fitness & -Scoring)", min_value=2, max_value=16, value=5, step=1)
 
     # Persistiere aktuelle Auswahl für Diagnostik
     st.session_state["dataset_B"] = dataset_B

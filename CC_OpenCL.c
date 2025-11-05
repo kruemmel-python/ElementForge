@@ -50,6 +50,55 @@
 #include "CipherCore_NoiseCtrl.h"
 #include "SymBio_Interface.h"
 
+/**
+ * @brief Returns a human-readable string for an OpenCL error code.
+ * Maps standard OpenCL error codes (negative integers) to descriptive strings.
+ * @param error The cl_int error code.
+ * @return A constant C string describing the error. Returns "Unknown OpenCL error %d" if the code is not recognized.
+ */
+const char* clGetErrorString(cl_int error) {
+    /* Static map of error codes to strings (standard OpenCL errors) */
+    static const char *errStr[] = {
+        "CL_SUCCESS", "CL_DEVICE_NOT_FOUND", "CL_DEVICE_NOT_AVAILABLE", "CL_COMPILER_NOT_AVAILABLE",
+        "CL_MEM_OBJECT_ALLOCATION_FAILURE", "CL_OUT_OF_RESOURCES", "CL_OUT_OF_HOST_MEMORY",
+        "CL_PROFILING_INFO_NOT_AVAILABLE", "CL_MEM_COPY_OVERLAP", "CL_IMAGE_FORMAT_MISMATCH",
+        "CL_IMAGE_FORMAT_NOT_SUPPORTED", "CL_BUILD_PROGRAM_FAILURE", "CL_MAP_FAILURE",
+        /* Placeholder for codes -13 to -29 */
+        "CL_MISALIGNED_SUB_BUFFER_OFFSET", "CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST", "CL_COMPILE_PROGRAM_FAILURE",
+        "CL_LINKER_NOT_AVAILABLE", "CL_LINK_PROGRAM_FAILURE", "CL_DEVICE_PARTITION_FAILED", "CL_KERNEL_ARG_INFO_NOT_AVAILABLE",
+        "", "", "", "", "", "", "", "", "", "",
+        "CL_INVALID_VALUE", "CL_INVALID_DEVICE_TYPE", "CL_INVALID_PLATFORM", "CL_INVALID_DEVICE", "CL_INVALID_CONTEXT",
+        "CL_INVALID_QUEUE_PROPERTIES", "CL_INVALID_COMMAND_QUEUE", "CL_INVALID_HOST_PTR", "CL_INVALID_MEM_OBJECT",
+        "CL_INVALID_IMAGE_FORMAT_DESCRIPTOR", "CL_INVALID_IMAGE_SIZE", "CL_INVALID_SAMPLER", "CL_INVALID_BINARY",
+        "CL_INVALID_BUILD_OPTIONS", "CL_INVALID_PROGRAM", "CL_INVALID_PROGRAM_EXECUTABLE", "CL_INVALID_KERNEL_NAME",
+        "CL_INVALID_KERNEL_DEFINITION", "CL_INVALID_KERNEL", "CL_INVALID_ARG_INDEX", "CL_INVALID_ARG_VALUE",
+        "CL_INVALID_ARG_SIZE", "CL_INVALID_KERNEL_ARGS", "CL_INVALID_WORK_DIMENSION", "CL_INVALID_WORK_GROUP_SIZE",
+        "CL_INVALID_WORK_ITEM_SIZE", "CL_INVALID_GLOBAL_OFFSET", "CL_INVALID_EVENT_WAIT_LIST", "CL_INVALID_EVENT",
+        "CL_INVALID_OPERATION", "CL_INVALID_GL_OBJECT", "CL_INVALID_BUFFER_SIZE", "CL_INVALID_MIP_LEVEL",
+        "CL_INVALID_GLOBAL_WORK_SIZE", "CL_INVALID_PROPERTY", "CL_INVALID_IMAGE_DESCRIPTOR", "CL_INVALID_COMPILER_OPTIONS",
+        "CL_INVALID_LINKER_OPTIONS", "CL_INVALID_DEVICE_PARTITION_COUNT",
+        /* Add more specific error codes for newer OpenCL versions if needed */
+        "CL_INVALID_PIPE_SIZE", "CL_INVALID_DEVICE_QUEUE" /* Examples for 2.0+ */
+    };
+    const int errCount = (int)(sizeof(errStr) / sizeof(errStr[0]));
+    const int index = -error; /* Error codes are negative integers */
+
+    /* Check if the index is within the bounds of our static map */
+    if (index >= 0 && index < errCount) {
+        const char* err = errStr[index];
+        /* Return the string if it's valid and not empty */
+        if (err && err[0] != '\0') {
+            return err;
+        }
+    }
+    /* If the error code is unknown or the string is empty, return a generic message */
+    static char unknown_error[64];
+    /* Use snprintf (C99) for better portability and safety */
+    snprintf(unknown_error, sizeof(unknown_error), "Unknown OpenCL error %d", error);
+    unknown_error[sizeof(unknown_error) - 1] = '\0'; /* Ensure null termination */
+    return unknown_error;
+}
+
 // --- Platform Specific Defines ---
 #ifndef M_PI
 /** @brief Definition of PI if not already defined. */
@@ -337,6 +386,11 @@ cl_kernel quantum_probability_kernel = NULL;
 cl_kernel quantum_expectation_pauli_z_kernel = NULL;
 cl_kernel quantum_apply_gate_kernel = NULL;
 
+cl_program mycel_program = NULL;
+cl_kernel mycel_reinforce_kernel = NULL;
+cl_kernel mycel_diffuse_kernel = NULL;
+cl_kernel mycel_nutrient_kernel = NULL;
+
 // ---------------------------------------------------------------------------
 // Mycel / Pheromone host-side state (emulation for DLL integration)
 // ---------------------------------------------------------------------------
@@ -374,14 +428,70 @@ typedef struct MycelState {
     float  decay_default;
     float  diffu_default;
     float  nutrient_recovery;
+
+    cl_mem pheromone_buf;
+    cl_mem neigh_idx_buf;
+    cl_mem decay_buf;
+    cl_mem diffu_buf;
+    cl_mem nutrient_buf;
+    cl_mem mood_buf;
+    cl_mem alive_buf;
+    cl_mem reinforce_gain_buf;
 } MycelState;
 
 static MycelState g_mycel_state = {0};
 
-static void mycel_free_state(MycelState* state) {
-    if (!state->initialized) {
+static void mycel_release_gpu_buffers(MycelState* state) {
+    if (!state) {
         return;
     }
+    if (state->pheromone_buf) { clReleaseMemObject(state->pheromone_buf); state->pheromone_buf = NULL; }
+    if (state->neigh_idx_buf) { clReleaseMemObject(state->neigh_idx_buf); state->neigh_idx_buf = NULL; }
+    if (state->decay_buf) { clReleaseMemObject(state->decay_buf); state->decay_buf = NULL; }
+    if (state->diffu_buf) { clReleaseMemObject(state->diffu_buf); state->diffu_buf = NULL; }
+    if (state->nutrient_buf) { clReleaseMemObject(state->nutrient_buf); state->nutrient_buf = NULL; }
+    if (state->mood_buf) { clReleaseMemObject(state->mood_buf); state->mood_buf = NULL; }
+    if (state->alive_buf) { clReleaseMemObject(state->alive_buf); state->alive_buf = NULL; }
+    if (state->reinforce_gain_buf) { clReleaseMemObject(state->reinforce_gain_buf); state->reinforce_gain_buf = NULL; }
+}
+
+static int mycel_upload_buffer(cl_mem buffer, const void* data, size_t bytes, const char* name) {
+    if (!buffer || bytes == 0) {
+        return 1;
+    }
+    if (!queue) {
+        fprintf(stderr, "[C] mycel_upload_buffer: Command queue unavailable for %s.\n", name ? name : "buffer");
+        return 0;
+    }
+    cl_int err = clEnqueueWriteBuffer(queue, buffer, CL_TRUE, 0, bytes, data, 0, NULL, NULL);
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "[C] mycel_upload_buffer: Failed to upload %s: %s (%d).\n", name ? name : "buffer", clGetErrorString(err), err);
+        return 0;
+    }
+    return 1;
+}
+
+static int mycel_download_buffer(cl_mem buffer, void* data, size_t bytes, const char* name) {
+    if (!buffer || bytes == 0) {
+        return 1;
+    }
+    if (!queue) {
+        fprintf(stderr, "[C] mycel_download_buffer: Command queue unavailable for %s.\n", name ? name : "buffer");
+        return 0;
+    }
+    cl_int err = clEnqueueReadBuffer(queue, buffer, CL_TRUE, 0, bytes, data, 0, NULL, NULL);
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "[C] mycel_download_buffer: Failed to download %s: %s (%d).\n", name ? name : "buffer", clGetErrorString(err), err);
+        return 0;
+    }
+    return 1;
+}
+
+static void mycel_free_state(MycelState* state) {
+    if (!state) {
+        return;
+    }
+    mycel_release_gpu_buffers(state);
     free(state->pheromone);
     free(state->neigh_idx);
     free(state->decay);
@@ -396,6 +506,116 @@ static void mycel_free_state(MycelState* state) {
     free(state->reinforce_gain);
     free(state->kappa_mood);
     memset(state, 0, sizeof(MycelState));
+}
+
+static int mycel_ensure_gpu_buffers(MycelState* state) {
+    if (!state) {
+        return 0;
+    }
+    if (state->pheromone_buf) {
+        return 1;
+    }
+    if (!context || !queue) {
+        fprintf(stderr, "[C] mycel_ensure_gpu_buffers: OpenCL context or queue unavailable.\n");
+        return 0;
+    }
+    cl_int err;
+    size_t edge_count = (size_t)state->T_cap * (size_t)state->K;
+    size_t pher_bytes = edge_count * (size_t)state->C * sizeof(float);
+    size_t neigh_bytes = edge_count * sizeof(int);
+    size_t decay_bytes = edge_count * sizeof(float);
+    size_t diffu_bytes = edge_count * sizeof(float);
+    size_t nutrient_bytes = (size_t)state->T_cap * sizeof(float);
+    size_t mood_bytes = (size_t)state->T_cap * (size_t)state->C * sizeof(float);
+    size_t alive_bytes = (size_t)state->T_cap * sizeof(uint8_t);
+    size_t gain_bytes = (size_t)state->C * sizeof(float);
+
+    state->pheromone_buf = (pher_bytes > 0) ? clCreateBuffer(context, CL_MEM_READ_WRITE, pher_bytes, NULL, &err) : NULL;
+    if (pher_bytes > 0 && (!state->pheromone_buf || err != CL_SUCCESS)) {
+        fprintf(stderr, "[C] mycel_ensure_gpu_buffers: Failed to allocate pheromone buffer: %s (%d).\n", clGetErrorString(err), err);
+        mycel_release_gpu_buffers(state);
+        return 0;
+    }
+    state->neigh_idx_buf = (neigh_bytes > 0) ? clCreateBuffer(context, CL_MEM_READ_WRITE, neigh_bytes, NULL, &err) : NULL;
+    if (neigh_bytes > 0 && (!state->neigh_idx_buf || err != CL_SUCCESS)) {
+        fprintf(stderr, "[C] mycel_ensure_gpu_buffers: Failed to allocate neighbor buffer: %s (%d).\n", clGetErrorString(err), err);
+        mycel_release_gpu_buffers(state);
+        return 0;
+    }
+    state->decay_buf = (decay_bytes > 0) ? clCreateBuffer(context, CL_MEM_READ_WRITE, decay_bytes, NULL, &err) : NULL;
+    if (decay_bytes > 0 && (!state->decay_buf || err != CL_SUCCESS)) {
+        fprintf(stderr, "[C] mycel_ensure_gpu_buffers: Failed to allocate decay buffer: %s (%d).\n", clGetErrorString(err), err);
+        mycel_release_gpu_buffers(state);
+        return 0;
+    }
+    state->diffu_buf = (diffu_bytes > 0) ? clCreateBuffer(context, CL_MEM_READ_WRITE, diffu_bytes, NULL, &err) : NULL;
+    if (diffu_bytes > 0 && (!state->diffu_buf || err != CL_SUCCESS)) {
+        fprintf(stderr, "[C] mycel_ensure_gpu_buffers: Failed to allocate diffusion buffer: %s (%d).\n", clGetErrorString(err), err);
+        mycel_release_gpu_buffers(state);
+        return 0;
+    }
+    state->nutrient_buf = (nutrient_bytes > 0) ? clCreateBuffer(context, CL_MEM_READ_WRITE, nutrient_bytes, NULL, &err) : NULL;
+    if (nutrient_bytes > 0 && (!state->nutrient_buf || err != CL_SUCCESS)) {
+        fprintf(stderr, "[C] mycel_ensure_gpu_buffers: Failed to allocate nutrient buffer: %s (%d).\n", clGetErrorString(err), err);
+        mycel_release_gpu_buffers(state);
+        return 0;
+    }
+    state->mood_buf = (mood_bytes > 0) ? clCreateBuffer(context, CL_MEM_READ_WRITE, mood_bytes, NULL, &err) : NULL;
+    if (mood_bytes > 0 && (!state->mood_buf || err != CL_SUCCESS)) {
+        fprintf(stderr, "[C] mycel_ensure_gpu_buffers: Failed to allocate mood buffer: %s (%d).\n", clGetErrorString(err), err);
+        mycel_release_gpu_buffers(state);
+        return 0;
+    }
+    state->alive_buf = (alive_bytes > 0) ? clCreateBuffer(context, CL_MEM_READ_WRITE, alive_bytes, NULL, &err) : NULL;
+    if (alive_bytes > 0 && (!state->alive_buf || err != CL_SUCCESS)) {
+        fprintf(stderr, "[C] mycel_ensure_gpu_buffers: Failed to allocate alive buffer: %s (%d).\n", clGetErrorString(err), err);
+        mycel_release_gpu_buffers(state);
+        return 0;
+    }
+    state->reinforce_gain_buf = (gain_bytes > 0) ? clCreateBuffer(context, CL_MEM_READ_WRITE, gain_bytes, NULL, &err) : NULL;
+    if (gain_bytes > 0 && (!state->reinforce_gain_buf || err != CL_SUCCESS)) {
+        fprintf(stderr, "[C] mycel_ensure_gpu_buffers: Failed to allocate reinforce buffer: %s (%d).\n", clGetErrorString(err), err);
+        mycel_release_gpu_buffers(state);
+        return 0;
+    }
+
+    if (!mycel_upload_buffer(state->pheromone_buf, state->pheromone, pher_bytes, "pheromone") ||
+        !mycel_upload_buffer(state->neigh_idx_buf, state->neigh_idx, neigh_bytes, "neigh_idx") ||
+        !mycel_upload_buffer(state->decay_buf, state->decay, decay_bytes, "decay") ||
+        !mycel_upload_buffer(state->diffu_buf, state->diffu, diffu_bytes, "diffu") ||
+        !mycel_upload_buffer(state->nutrient_buf, state->nutrient, nutrient_bytes, "nutrient") ||
+        !mycel_upload_buffer(state->mood_buf, state->mood, mood_bytes, "mood") ||
+        !mycel_upload_buffer(state->alive_buf, state->alive, alive_bytes, "alive") ||
+        !mycel_upload_buffer(state->reinforce_gain_buf, state->reinforce_gain, gain_bytes, "reinforce_gain")) {
+        mycel_release_gpu_buffers(state);
+        return 0;
+    }
+
+    return 1;
+}
+
+static int mycel_upload_all_state(MycelState* state) {
+    if (!mycel_ensure_gpu_buffers(state)) {
+        return 0;
+    }
+    size_t edge_count = (size_t)state->T_cap * (size_t)state->K;
+    size_t pher_bytes = edge_count * (size_t)state->C * sizeof(float);
+    size_t neigh_bytes = edge_count * sizeof(int);
+    size_t decay_bytes = edge_count * sizeof(float);
+    size_t diffu_bytes = edge_count * sizeof(float);
+    size_t nutrient_bytes = (size_t)state->T_cap * sizeof(float);
+    size_t mood_bytes = (size_t)state->T_cap * (size_t)state->C * sizeof(float);
+    size_t alive_bytes = (size_t)state->T_cap * sizeof(uint8_t);
+    size_t gain_bytes = (size_t)state->C * sizeof(float);
+
+    return mycel_upload_buffer(state->pheromone_buf, state->pheromone, pher_bytes, "pheromone") &&
+           mycel_upload_buffer(state->neigh_idx_buf, state->neigh_idx, neigh_bytes, "neigh_idx") &&
+           mycel_upload_buffer(state->decay_buf, state->decay, decay_bytes, "decay") &&
+           mycel_upload_buffer(state->diffu_buf, state->diffu, diffu_bytes, "diffu") &&
+           mycel_upload_buffer(state->nutrient_buf, state->nutrient, nutrient_bytes, "nutrient") &&
+           mycel_upload_buffer(state->mood_buf, state->mood, mood_bytes, "mood") &&
+           mycel_upload_buffer(state->alive_buf, state->alive, alive_bytes, "alive") &&
+           mycel_upload_buffer(state->reinforce_gain_buf, state->reinforce_gain, gain_bytes, "reinforce_gain");
 }
 
 static size_t mycel_edge_count(const MycelState* state) {
@@ -460,6 +680,10 @@ static int mycel_initialize(MycelState* state, int T_cap, int C, int K) {
     if (T_cap <= 0 || C <= 0 || K <= 0) {
         return 0;
     }
+    if (!context || !queue) {
+        fprintf(stderr, "[C] mycel_initialize: OpenCL context not initialized.\n");
+        return 0;
+    }
     mycel_free_state(state);
 
     size_t edge_count = (size_t)T_cap * (size_t)K;
@@ -509,6 +733,10 @@ static int mycel_initialize(MycelState* state, int T_cap, int C, int K) {
     state->diffu_default = 0.0f;
     state->nutrient_recovery = 0.01f;
     state->kappa_nutrient = 0.0f;
+    if (!mycel_upload_all_state(state)) {
+        mycel_free_state(state);
+        return 0;
+    }
     state->initialized = true;
     return 1;
 }
@@ -884,7 +1112,6 @@ cl_int compile_opencl_kernel_variant(const char* kernel_source, const char* kern
 cl_int compile_opencl_kernel_dual(const char* kernel_source, const char* kernel_name,
                                   cl_program* strict_program_out, cl_kernel* strict_kernel_out,
                                   cl_program* fast_program_out, cl_kernel* fast_kernel_out);
-const char* clGetErrorString(cl_int error);
 int submit_kernel_command(int gpu_index, GPUCommand command, void *data);
 int finish_queue_and_check(int gpu_index, const char* func_name);
 void shutdown_driver();
@@ -2431,6 +2658,120 @@ const char *shape_loss_reward_penalty_list_kernel_src =
 "    }\n"
 "}";
 
+const char *mycel_kernel_src =
+"__kernel void mycel_reinforce(__global float* pheromone,\n"
+"                              __global const int* neigh_idx,\n"
+"                              __global const uchar* alive,\n"
+"                              __global const float* mood,\n"
+"                              __global const float* reinforce_gain,\n"
+"                              __global const float* activity,\n"
+"                              const int T_act,\n"
+"                              const int T_cap,\n"
+"                              const int K,\n"
+"                              const int C) {\n"
+"    if (get_global_id(0) != 0) {\n"
+"        return;\n"
+"    }\n"
+"    for (int t = 0; t < T_act; ++t) {\n"
+"        if (!alive[t]) {\n"
+"            continue;\n"
+"        }\n"
+"        float act = activity ? activity[t] : 0.0f;\n"
+"        if (act <= 0.0f) {\n"
+"            continue;\n"
+"        }\n"
+"        for (int k = 0; k < K; ++k) {\n"
+"            int nb = neigh_idx[t * K + k];\n"
+"            if (nb < 0 || nb >= T_cap) {\n"
+"                continue;\n"
+"            }\n"
+"            ulong edge = ((ulong)t * (ulong)K) + (ulong)k;\n"
+"            for (int c = 0; c < C; ++c) {\n"
+"                float mood_factor = mood[t * C + c];\n"
+"                if (mood_factor == 0.0f) {\n"
+"                    mood_factor = 1.0f;\n"
+"                }\n"
+"                ulong idx = edge * (ulong)C + (ulong)c;\n"
+"                float delta = reinforce_gain[c] * act * mood_factor;\n"
+"                float value = pheromone[idx] + delta;\n"
+"                if (value < 0.0f) {\n"
+"                    value = 0.0f;\n"
+"                }\n"
+"                pheromone[idx] = value;\n"
+"            }\n"
+"        }\n"
+"    }\n"
+"}\n"
+"\n"
+"__kernel void mycel_diffuse_decay(__global float* pheromone,\n"
+"                                  __global const int* neigh_idx,\n"
+"                                  __global const uchar* alive,\n"
+"                                  __global const float* decay,\n"
+"                                  __global const float* diffu,\n"
+"                                  const int T_act,\n"
+"                                  const int T_cap,\n"
+"                                  const int K,\n"
+"                                  const int C) {\n"
+"    if (get_global_id(0) != 0) {\n"
+"        return;\n"
+"    }\n"
+"    ulong edge_count = (ulong)T_cap * (ulong)K;\n"
+"    for (ulong edge = 0; edge < edge_count; ++edge) {\n"
+"        int t = (int)(edge / (ulong)K);\n"
+"        if (t >= T_act || !alive[t]) {\n"
+"            continue;\n"
+"        }\n"
+"        int nb = neigh_idx[edge];\n"
+"        if (nb < 0 || nb >= T_cap || !alive[nb]) {\n"
+"            continue;\n"
+"        }\n"
+"        float edge_decay = decay[edge];\n"
+"        float edge_diffu = diffu[edge];\n"
+"        for (int c = 0; c < C; ++c) {\n"
+"            ulong idx = edge * (ulong)C + (ulong)c;\n"
+"            float p = pheromone[idx];\n"
+"            float neighbor_sum = 0.0f;\n"
+"            int neighbor_deg = 0;\n"
+"            for (int kk = 0; kk < K; ++kk) {\n"
+"                int nb2 = neigh_idx[(ulong)nb * (ulong)K + (ulong)kk];\n"
+"                if (nb2 < 0 || nb2 >= T_cap) {\n"
+"                    continue;\n"
+"                }\n"
+"                ulong nidx = ((ulong)nb * (ulong)K + (ulong)kk) * (ulong)C + (ulong)c;\n"
+"                neighbor_sum += pheromone[nidx];\n"
+"                neighbor_deg += 1;\n"
+"            }\n"
+"            float neighbor_avg = (neighbor_deg > 0) ? (neighbor_sum / (float)neighbor_deg) : p;\n"
+"            float value = p * (1.0f - edge_decay) + edge_diffu * (neighbor_avg - p);\n"
+"            if (value < 0.0f) {\n"
+"                value = 0.0f;\n"
+"            }\n"
+"            pheromone[idx] = value;\n"
+"        }\n"
+"    }\n"
+"}\n"
+"\n"
+"__kernel void mycel_nutrient_update(__global float* nutrient,\n"
+"                                    __global const uchar* alive,\n"
+"                                    __global const float* activity,\n"
+"                                    const float recovery,\n"
+"                                    const int T_act) {\n"
+"    if (get_global_id(0) != 0) {\n"
+"        return;\n"
+"    }\n"
+"    for (int t = 0; t < T_act; ++t) {\n"
+"        if (!alive[t]) {\n"
+"            continue;\n"
+"        }\n"
+"        float act = activity ? activity[t] : 0.0f;\n"
+"        float nu = nutrient[t] + act - recovery * nutrient[t];\n"
+"        if (nu < 0.0f) {\n"
+"            nu = 0.0f;\n"
+"        }\n"
+"        nutrient[t] = nu;\n"
+"    }\n"
+"}\n";
+
 const char *subqg_simulation_kernel_src =
 "#ifndef M_PI\n"
 "#define M_PI 3.14159265358979323846\n"
@@ -2746,55 +3087,6 @@ const char *quantum_simulation_kernels_src =
 // --- Helper Function Implementations ---
 
 /**
- * @brief Returns a human-readable string for an OpenCL error code.
- * Maps standard OpenCL error codes (negative integers) to descriptive strings.
- * @param error The cl_int error code.
- * @return A constant C string describing the error. Returns "Unknown OpenCL error %d" if the code is not recognized.
- */
-const char* clGetErrorString(cl_int error) {
-     // Static map of error codes to strings (standard OpenCL errors)
-    static const char *errStr[] = {
-        "CL_SUCCESS", "CL_DEVICE_NOT_FOUND", "CL_DEVICE_NOT_AVAILABLE", "CL_COMPILER_NOT_AVAILABLE",
-        "CL_MEM_OBJECT_ALLOCATION_FAILURE", "CL_OUT_OF_RESOURCES", "CL_OUT_OF_HOST_MEMORY",
-        "CL_PROFILING_INFO_NOT_AVAILABLE", "CL_MEM_COPY_OVERLAP", "CL_IMAGE_FORMAT_MISMATCH",
-        "CL_IMAGE_FORMAT_NOT_SUPPORTED", "CL_BUILD_PROGRAM_FAILURE", "CL_MAP_FAILURE",
-        /* Placeholder for codes -13 to -29 */
-        "CL_MISALIGNED_SUB_BUFFER_OFFSET", "CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST", "CL_COMPILE_PROGRAM_FAILURE",
-        "CL_LINKER_NOT_AVAILABLE", "CL_LINK_PROGRAM_FAILURE", "CL_DEVICE_PARTITION_FAILED", "CL_KERNEL_ARG_INFO_NOT_AVAILABLE",
-        "", "", "", "", "", "", "", "", "", "",
-        "CL_INVALID_VALUE", "CL_INVALID_DEVICE_TYPE", "CL_INVALID_PLATFORM", "CL_INVALID_DEVICE", "CL_INVALID_CONTEXT",
-        "CL_INVALID_QUEUE_PROPERTIES", "CL_INVALID_COMMAND_QUEUE", "CL_INVALID_HOST_PTR", "CL_INVALID_MEM_OBJECT",
-        "CL_INVALID_IMAGE_FORMAT_DESCRIPTOR", "CL_INVALID_IMAGE_SIZE", "CL_INVALID_SAMPLER", "CL_INVALID_BINARY",
-        "CL_INVALID_BUILD_OPTIONS", "CL_INVALID_PROGRAM", "CL_INVALID_PROGRAM_EXECUTABLE", "CL_INVALID_KERNEL_NAME",
-        "CL_INVALID_KERNEL_DEFINITION", "CL_INVALID_KERNEL", "CL_INVALID_ARG_INDEX", "CL_INVALID_ARG_VALUE",
-        "CL_INVALID_ARG_SIZE", "CL_INVALID_KERNEL_ARGS", "CL_INVALID_WORK_DIMENSION", "CL_INVALID_WORK_GROUP_SIZE",
-        "CL_INVALID_WORK_ITEM_SIZE", "CL_INVALID_GLOBAL_OFFSET", "CL_INVALID_EVENT_WAIT_LIST", "CL_INVALID_EVENT",
-        "CL_INVALID_OPERATION", "CL_INVALID_GL_OBJECT", "CL_INVALID_BUFFER_SIZE", "CL_INVALID_MIP_LEVEL",
-        "CL_INVALID_GLOBAL_WORK_SIZE", "CL_INVALID_PROPERTY", "CL_INVALID_IMAGE_DESCRIPTOR", "CL_INVALID_COMPILER_OPTIONS",
-        "CL_INVALID_LINKER_OPTIONS", "CL_INVALID_DEVICE_PARTITION_COUNT",
-        /* Add more specific error codes for newer OpenCL versions if needed */
-        "CL_INVALID_PIPE_SIZE", "CL_INVALID_DEVICE_QUEUE" /* Examples for 2.0+ */
-    };
-    const int errCount = sizeof(errStr) / sizeof(errStr[0]);
-    const int index = -error; /* Error codes are negative integers */
-
-    /* Check if the index is within the bounds of our static map */
-    if (index >= 0 && index < errCount) {
-        const char* err = errStr[index];
-        /* Return the string if it's valid and not empty */
-        if (err && err[0] != '\0') {
-             return err;
-        }
-    }
-    /* If the error code is unknown or the string is empty, return a generic message */
-    static char unknown_error[64];
-    /* Use snprintf (C99) for better portability and safety */
-    snprintf(unknown_error, sizeof(unknown_error), "Unknown OpenCL error %d", error);
-    unknown_error[sizeof(unknown_error) - 1] = '\0'; /* Ensure null termination */
-    return unknown_error;
-}
-
-/**
  * @brief Retrieve profiling counters from the most recent quantum echo execution.
  *
  * @param out_profile Destination pointer receiving the collected counters.
@@ -3045,6 +3337,9 @@ void shutdown_driver() {
     RELEASE_KERNEL(subqg_simulation_kernel);
     RELEASE_KERNEL(subqg_simulation_kernel_fast);
     RELEASE_KERNEL(subqg_agent_kernel);
+    RELEASE_KERNEL(mycel_reinforce_kernel);
+    RELEASE_KERNEL(mycel_diffuse_kernel);
+    RELEASE_KERNEL(mycel_nutrient_kernel);
     RELEASE_KERNEL(sqse_encrypt_kernel);
     RELEASE_KERNEL(sqse_decrypt_kernel);
     RELEASE_KERNEL(quantum_single_qubit_kernel);
@@ -3137,6 +3432,7 @@ void shutdown_driver() {
     RELEASE_PROGRAM(subqg_simulation_program);
     RELEASE_PROGRAM(subqg_simulation_program_fast);
     RELEASE_PROGRAM(subqg_agent_program);
+    RELEASE_PROGRAM(mycel_program);
     RELEASE_PROGRAM(sqse_program);
     RELEASE_PROGRAM(quantum_program);
     #undef RELEASE_PROGRAM
@@ -3765,6 +4061,30 @@ DLLEXPORT int initialize_gpu(int gpu_index) {
     if (compile_err != CL_SUCCESS || !subqg_agent_kernel) {
         fprintf(stderr, "[C] initialize_gpu: Failed to compile subqg agent kernel: %s (%d)\n",
                 clGetErrorString(compile_err), compile_err);
+        shutdown_driver();
+        return 0;
+    }
+    printf("[C] initialize_gpu: Compiling Mycel kernels...\n");
+    compile_err = compile_opencl_kernel_variant(mycel_kernel_src, "mycel_reinforce",
+                                                &mycel_program, &mycel_reinforce_kernel, 0);
+    if (compile_err != CL_SUCCESS || !mycel_program || !mycel_reinforce_kernel) {
+        fprintf(stderr, "[C] initialize_gpu: Failed to compile Mycel reinforcement kernel: %s (%d)\n",
+                clGetErrorString(compile_err), compile_err);
+        shutdown_driver();
+        return 0;
+    }
+    cl_int mycel_err = CL_SUCCESS;
+    mycel_diffuse_kernel = clCreateKernel(mycel_program, "mycel_diffuse_decay", &mycel_err);
+    if (mycel_err != CL_SUCCESS || !mycel_diffuse_kernel) {
+        fprintf(stderr, "[C] initialize_gpu: Failed to create Mycel diffusion kernel: %s (%d)\n",
+                clGetErrorString(mycel_err), mycel_err);
+        shutdown_driver();
+        return 0;
+    }
+    mycel_nutrient_kernel = clCreateKernel(mycel_program, "mycel_nutrient_update", &mycel_err);
+    if (mycel_err != CL_SUCCESS || !mycel_nutrient_kernel) {
+        fprintf(stderr, "[C] initialize_gpu: Failed to create Mycel nutrient kernel: %s (%d)\n",
+                clGetErrorString(mycel_err), mycel_err);
         shutdown_driver();
         return 0;
     }
@@ -4562,6 +4882,9 @@ DLLEXPORT int subqg_set_active_T(int gpu_index, int T_act) {
         fprintf(stderr, "[C] subqg_set_active_T: Invalid T_act=%d (cap=%d).\n", T_act, st->T_cap);
         return 0;
     }
+    if (!mycel_ensure_gpu_buffers(st)) {
+        return 0;
+    }
     st->T_act = T_act;
     st->free_head = 0;
     for (int i = st->T_cap - 1; i >= 0; --i) {
@@ -4571,6 +4894,9 @@ DLLEXPORT int subqg_set_active_T(int gpu_index, int T_act) {
             st->alive[i] = 0;
             st->free_list[st->free_head++] = i;
         }
+    }
+    if (!mycel_upload_buffer(st->alive_buf, st->alive, (size_t)st->T_cap * sizeof(uint8_t), "alive")) {
+        return 0;
     }
     return 1;
 }
@@ -4591,6 +4917,7 @@ DLLEXPORT int subqg_realloc_pheromone_channels(int gpu_index, int new_C) {
     }
     int old_C = st->C;
     size_t edge_count = mycel_edge_count(st);
+    mycel_release_gpu_buffers(st);
     size_t new_pher_count = (size_t)new_C * edge_count;
     size_t new_mood_count = (size_t)new_C * (size_t)st->T_cap;
     float* new_pheromone = (float*)calloc(new_pher_count, sizeof(float));
@@ -4633,6 +4960,9 @@ DLLEXPORT int subqg_realloc_pheromone_channels(int gpu_index, int new_C) {
     st->reinforce_gain = new_reinforce;
     st->kappa_mood = new_kappa;
     st->C = new_C;
+    if (!mycel_upload_all_state(st)) {
+        return 0;
+    }
     return 1;
 }
 
@@ -4674,10 +5004,16 @@ DLLEXPORT int set_pheromone_gains(int gpu_index, const float* gain_C, int count)
         fprintf(stderr, "[C] set_pheromone_gains: Invalid gain array.\n");
         return 0;
     }
+    if (!mycel_ensure_gpu_buffers(st)) {
+        return 0;
+    }
     int copy = (count < st->C) ? count : st->C;
     memcpy(st->reinforce_gain, gain_C, (size_t)copy * sizeof(float));
     for (int i = copy; i < st->C; ++i) {
         st->reinforce_gain[i] = 0.0f;
+    }
+    if (!mycel_upload_buffer(st->reinforce_gain_buf, st->reinforce_gain, (size_t)st->C * sizeof(float), "reinforce_gain")) {
+        return 0;
     }
     return 1;
 }
@@ -4689,12 +5025,19 @@ DLLEXPORT int set_diffusion_params(int gpu_index, float decay_default, float dif
         fprintf(stderr, "[C] set_diffusion_params: State not initialized.\n");
         return 0;
     }
+    if (!mycel_ensure_gpu_buffers(st)) {
+        return 0;
+    }
     st->decay_default = decay_default;
     st->diffu_default = diffu_default;
     size_t edge_count = mycel_edge_count(st);
     for (size_t i = 0; i < edge_count; ++i) {
         st->decay[i] = decay_default;
         st->diffu[i] = diffu_default;
+    }
+    if (!mycel_upload_buffer(st->decay_buf, st->decay, edge_count * sizeof(float), "decay") ||
+        !mycel_upload_buffer(st->diffu_buf, st->diffu, edge_count * sizeof(float), "diffu")) {
+        return 0;
     }
     return 1;
 }
@@ -4710,8 +5053,14 @@ DLLEXPORT int set_neighbors_sparse(int gpu_index, const int* neigh_idx_TK) {
         fprintf(stderr, "[C] set_neighbors_sparse: neigh_idx pointer is NULL.\n");
         return 0;
     }
+    if (!mycel_ensure_gpu_buffers(st)) {
+        return 0;
+    }
     size_t total = mycel_edge_count(st);
     memcpy(st->neigh_idx, neigh_idx_TK, total * sizeof(int));
+    if (!mycel_upload_buffer(st->neigh_idx_buf, st->neigh_idx, total * sizeof(int), "neigh_idx")) {
+        return 0;
+    }
     return 1;
 }
 
@@ -4726,8 +5075,14 @@ DLLEXPORT int set_mood_state(int gpu_index, const float* mood_tC) {
         fprintf(stderr, "[C] set_mood_state: mood array is NULL.\n");
         return 0;
     }
+    if (!mycel_ensure_gpu_buffers(st)) {
+        return 0;
+    }
     size_t count = (size_t)st->T_cap * (size_t)st->C;
     memcpy(st->mood, mood_tC, count * sizeof(float));
+    if (!mycel_upload_buffer(st->mood_buf, st->mood, count * sizeof(float), "mood")) {
+        return 0;
+    }
     return 1;
 }
 
@@ -4742,7 +5097,13 @@ DLLEXPORT int set_nutrient_state(int gpu_index, const float* nutrient_t) {
         fprintf(stderr, "[C] set_nutrient_state: nutrient array is NULL.\n");
         return 0;
     }
+    if (!mycel_ensure_gpu_buffers(st)) {
+        return 0;
+    }
     memcpy(st->nutrient, nutrient_t, (size_t)st->T_cap * sizeof(float));
+    if (!mycel_upload_buffer(st->nutrient_buf, st->nutrient, (size_t)st->T_cap * sizeof(float), "nutrient")) {
+        return 0;
+    }
     return 1;
 }
 
@@ -4757,32 +5118,70 @@ DLLEXPORT int step_pheromone_reinforce(int gpu_index, const float* activity_t) {
         fprintf(stderr, "[C] step_pheromone_reinforce: activity pointer is NULL.\n");
         return 0;
     }
-    for (int t = 0; t < st->T_act; ++t) {
-        if (!st->alive[t]) {
-            continue;
+    if (!mycel_upload_all_state(st)) {
+        return 0;
+    }
+    size_t edge_count = mycel_edge_count(st);
+    size_t pher_bytes = edge_count * (size_t)st->C * sizeof(float);
+    size_t activity_bytes = (size_t)st->T_cap * sizeof(float);
+    cl_int err = CL_SUCCESS;
+    cl_mem activity_buf = NULL;
+    if (activity_bytes > 0) {
+        activity_buf = clCreateBuffer(context, CL_MEM_READ_WRITE, activity_bytes, NULL, &err);
+        if (!activity_buf || err != CL_SUCCESS) {
+            fprintf(stderr, "[C] step_pheromone_reinforce: Failed to allocate activity buffer: %s (%d).\n", clGetErrorString(err), err);
+            if (activity_buf) { clReleaseMemObject(activity_buf); }
+            return 0;
         }
-        float act = activity_t[t];
-        if (act <= 0.0f) {
-            continue;
+        err = clEnqueueWriteBuffer(queue, activity_buf, CL_TRUE, 0, activity_bytes, activity_t, 0, NULL, NULL);
+        if (err != CL_SUCCESS) {
+            fprintf(stderr, "[C] step_pheromone_reinforce: Failed to upload activity: %s (%d).\n", clGetErrorString(err), err);
+            clReleaseMemObject(activity_buf);
+            return 0;
         }
-        for (int k = 0; k < st->K; ++k) {
-            int nb = st->neigh_idx[t * st->K + k];
-            if (nb < 0 || nb >= st->T_cap) {
-                continue;
-            }
-            for (int c = 0; c < st->C; ++c) {
-                float mood_factor = st->mood[t * st->C + c];
-                if (mood_factor == 0.0f) {
-                    mood_factor = 1.0f;
-                }
-                size_t idx = ((size_t)t * (size_t)st->K + (size_t)k) * (size_t)st->C + (size_t)c;
-                float delta = st->reinforce_gain[c] * act * mood_factor;
-                st->pheromone[idx] += delta;
-                if (st->pheromone[idx] < 0.0f) {
-                    st->pheromone[idx] = 0.0f;
-                }
-            }
-        }
+    }
+
+    cl_int T_act = (cl_int)st->T_act;
+    cl_int T_cap = (cl_int)st->T_cap;
+    cl_int K = (cl_int)st->K;
+    cl_int C = (cl_int)st->C;
+    int arg = 0;
+    err = CL_SUCCESS;
+    err |= clSetKernelArg(mycel_reinforce_kernel, arg++, sizeof(cl_mem), &st->pheromone_buf);
+    err |= clSetKernelArg(mycel_reinforce_kernel, arg++, sizeof(cl_mem), &st->neigh_idx_buf);
+    err |= clSetKernelArg(mycel_reinforce_kernel, arg++, sizeof(cl_mem), &st->alive_buf);
+    err |= clSetKernelArg(mycel_reinforce_kernel, arg++, sizeof(cl_mem), &st->mood_buf);
+    err |= clSetKernelArg(mycel_reinforce_kernel, arg++, sizeof(cl_mem), &st->reinforce_gain_buf);
+    err |= clSetKernelArg(mycel_reinforce_kernel, arg++, sizeof(cl_mem), &activity_buf);
+    err |= clSetKernelArg(mycel_reinforce_kernel, arg++, sizeof(cl_int), &T_act);
+    err |= clSetKernelArg(mycel_reinforce_kernel, arg++, sizeof(cl_int), &T_cap);
+    err |= clSetKernelArg(mycel_reinforce_kernel, arg++, sizeof(cl_int), &K);
+    err |= clSetKernelArg(mycel_reinforce_kernel, arg++, sizeof(cl_int), &C);
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "[C] step_pheromone_reinforce: Failed to set kernel args: %s (%d).\n", clGetErrorString(err), err);
+        if (activity_buf) { clReleaseMemObject(activity_buf); }
+        return 0;
+    }
+
+    size_t global = 1;
+    err = clEnqueueNDRangeKernel(queue, mycel_reinforce_kernel, 1, NULL, &global, NULL, 0, NULL, NULL);
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "[C] step_pheromone_reinforce: Failed to enqueue kernel: %s (%d).\n", clGetErrorString(err), err);
+        if (activity_buf) { clReleaseMemObject(activity_buf); }
+        return 0;
+    }
+    err = clFinish(queue);
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "[C] step_pheromone_reinforce: clFinish failed: %s (%d).\n", clGetErrorString(err), err);
+        if (activity_buf) { clReleaseMemObject(activity_buf); }
+        return 0;
+    }
+    if (!mycel_download_buffer(st->pheromone_buf, st->pheromone, pher_bytes, "pheromone")) {
+        if (activity_buf) { clReleaseMemObject(activity_buf); }
+        return 0;
+    }
+    if (activity_buf) {
+        clReleaseMemObject(activity_buf);
     }
     return 1;
 }
@@ -4794,39 +5193,43 @@ DLLEXPORT int step_pheromone_diffuse_decay(int gpu_index) {
         fprintf(stderr, "[C] step_pheromone_diffuse_decay: State not initialized.\n");
         return 0;
     }
+    if (!mycel_upload_all_state(st)) {
+        return 0;
+    }
     size_t edge_count = mycel_edge_count(st);
-    for (size_t edge = 0; edge < edge_count; ++edge) {
-        int t = (int)(edge / (size_t)st->K);
-        if (t >= st->T_act || !st->alive[t]) {
-            continue;
-        }
-        int nb = st->neigh_idx[edge];
-        if (nb < 0 || nb >= st->T_cap || !st->alive[nb]) {
-            continue;
-        }
-        float decay = st->decay[edge];
-        float diffu = st->diffu[edge];
-        for (int c = 0; c < st->C; ++c) {
-            size_t idx = edge * (size_t)st->C + (size_t)c;
-            float p = st->pheromone[idx];
-            float neighbor_sum = 0.0f;
-            int neighbor_deg = 0;
-            for (int kk = 0; kk < st->K; ++kk) {
-                int nb2 = st->neigh_idx[nb * st->K + kk];
-                if (nb2 < 0 || nb2 >= st->T_cap) {
-                    continue;
-                }
-                size_t nidx = ((size_t)nb * (size_t)st->K + (size_t)kk) * (size_t)st->C + (size_t)c;
-                neighbor_sum += st->pheromone[nidx];
-                neighbor_deg += 1;
-            }
-            float neighbor_avg = (neighbor_deg > 0) ? (neighbor_sum / (float)neighbor_deg) : p;
-            float value = p * (1.0f - decay) + diffu * (neighbor_avg - p);
-            if (value < 0.0f) {
-                value = 0.0f;
-            }
-            st->pheromone[idx] = value;
-        }
+    size_t pher_bytes = edge_count * (size_t)st->C * sizeof(float);
+    cl_int err = CL_SUCCESS;
+    cl_int T_act = (cl_int)st->T_act;
+    cl_int T_cap = (cl_int)st->T_cap;
+    cl_int K = (cl_int)st->K;
+    cl_int C = (cl_int)st->C;
+    int arg = 0;
+    err |= clSetKernelArg(mycel_diffuse_kernel, arg++, sizeof(cl_mem), &st->pheromone_buf);
+    err |= clSetKernelArg(mycel_diffuse_kernel, arg++, sizeof(cl_mem), &st->neigh_idx_buf);
+    err |= clSetKernelArg(mycel_diffuse_kernel, arg++, sizeof(cl_mem), &st->alive_buf);
+    err |= clSetKernelArg(mycel_diffuse_kernel, arg++, sizeof(cl_mem), &st->decay_buf);
+    err |= clSetKernelArg(mycel_diffuse_kernel, arg++, sizeof(cl_mem), &st->diffu_buf);
+    err |= clSetKernelArg(mycel_diffuse_kernel, arg++, sizeof(cl_int), &T_act);
+    err |= clSetKernelArg(mycel_diffuse_kernel, arg++, sizeof(cl_int), &T_cap);
+    err |= clSetKernelArg(mycel_diffuse_kernel, arg++, sizeof(cl_int), &K);
+    err |= clSetKernelArg(mycel_diffuse_kernel, arg++, sizeof(cl_int), &C);
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "[C] step_pheromone_diffuse_decay: Failed to set kernel args: %s (%d).\n", clGetErrorString(err), err);
+        return 0;
+    }
+    size_t global = 1;
+    err = clEnqueueNDRangeKernel(queue, mycel_diffuse_kernel, 1, NULL, &global, NULL, 0, NULL, NULL);
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "[C] step_pheromone_diffuse_decay: Failed to enqueue kernel: %s (%d).\n", clGetErrorString(err), err);
+        return 0;
+    }
+    err = clFinish(queue);
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "[C] step_pheromone_diffuse_decay: clFinish failed: %s (%d).\n", clGetErrorString(err), err);
+        return 0;
+    }
+    if (!mycel_download_buffer(st->pheromone_buf, st->pheromone, pher_bytes, "pheromone")) {
+        return 0;
     }
     return 1;
 }
@@ -4842,16 +5245,61 @@ DLLEXPORT int step_mycel_update(int gpu_index, const float* activity_t) {
         fprintf(stderr, "[C] step_mycel_update: activity pointer is NULL.\n");
         return 0;
     }
-    for (int t = 0; t < st->T_act; ++t) {
-        if (!st->alive[t]) {
-            continue;
+    if (!mycel_upload_all_state(st)) {
+        return 0;
+    }
+    size_t nutrient_bytes = (size_t)st->T_cap * sizeof(float);
+    size_t activity_bytes = (size_t)st->T_cap * sizeof(float);
+    cl_int err = CL_SUCCESS;
+    cl_mem activity_buf = NULL;
+    if (activity_bytes > 0) {
+        activity_buf = clCreateBuffer(context, CL_MEM_READ_WRITE, activity_bytes, NULL, &err);
+        if (!activity_buf || err != CL_SUCCESS) {
+            fprintf(stderr, "[C] step_mycel_update: Failed to allocate activity buffer: %s (%d).\n", clGetErrorString(err), err);
+            if (activity_buf) { clReleaseMemObject(activity_buf); }
+            return 0;
         }
-        float act = activity_t[t];
-        float nu = st->nutrient[t] + act - st->nutrient_recovery * st->nutrient[t];
-        if (nu < 0.0f) {
-            nu = 0.0f;
+        err = clEnqueueWriteBuffer(queue, activity_buf, CL_TRUE, 0, activity_bytes, activity_t, 0, NULL, NULL);
+        if (err != CL_SUCCESS) {
+            fprintf(stderr, "[C] step_mycel_update: Failed to upload activity: %s (%d).\n", clGetErrorString(err), err);
+            clReleaseMemObject(activity_buf);
+            return 0;
         }
-        st->nutrient[t] = nu;
+    }
+
+    cl_int T_act = (cl_int)st->T_act;
+    cl_float recovery = (cl_float)st->nutrient_recovery;
+    int arg = 0;
+    err = CL_SUCCESS;
+    err |= clSetKernelArg(mycel_nutrient_kernel, arg++, sizeof(cl_mem), &st->nutrient_buf);
+    err |= clSetKernelArg(mycel_nutrient_kernel, arg++, sizeof(cl_mem), &st->alive_buf);
+    err |= clSetKernelArg(mycel_nutrient_kernel, arg++, sizeof(cl_mem), &activity_buf);
+    err |= clSetKernelArg(mycel_nutrient_kernel, arg++, sizeof(cl_float), &recovery);
+    err |= clSetKernelArg(mycel_nutrient_kernel, arg++, sizeof(cl_int), &T_act);
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "[C] step_mycel_update: Failed to set kernel args: %s (%d).\n", clGetErrorString(err), err);
+        if (activity_buf) { clReleaseMemObject(activity_buf); }
+        return 0;
+    }
+    size_t global = 1;
+    err = clEnqueueNDRangeKernel(queue, mycel_nutrient_kernel, 1, NULL, &global, NULL, 0, NULL, NULL);
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "[C] step_mycel_update: Failed to enqueue kernel: %s (%d).\n", clGetErrorString(err), err);
+        if (activity_buf) { clReleaseMemObject(activity_buf); }
+        return 0;
+    }
+    err = clFinish(queue);
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "[C] step_mycel_update: clFinish failed: %s (%d).\n", clGetErrorString(err), err);
+        if (activity_buf) { clReleaseMemObject(activity_buf); }
+        return 0;
+    }
+    if (!mycel_download_buffer(st->nutrient_buf, st->nutrient, nutrient_bytes, "nutrient")) {
+        if (activity_buf) { clReleaseMemObject(activity_buf); }
+        return 0;
+    }
+    if (activity_buf) {
+        clReleaseMemObject(activity_buf);
     }
     return 1;
 }
@@ -4961,6 +5409,10 @@ DLLEXPORT int step_reproduction(int gpu_index, const float* activity_t, const fl
     }
     if (spawned > 0) {
         mycel_recompute_active_count(st);
+        if (!mycel_upload_all_state(st)) {
+            fprintf(stderr, "[C] step_reproduction: Failed to synchronize state with GPU.\n");
+            return 0;
+        }
     }
     return spawned;
 }
@@ -5207,6 +5659,12 @@ DLLEXPORT int load_mycel_state(int gpu_index, const char* path) {
     st->diffu_default = extras2[1];
     fread(&st->nutrient_recovery, sizeof(float), 1, f);
     fread(&st->kappa_nutrient, sizeof(float), 1, f);
+    if (!mycel_upload_all_state(st)) {
+        fprintf(stderr, "[C] load_mycel_state: Failed to synchronize loaded state with GPU.\n");
+        fclose(f);
+        mycel_free_state(st);
+        return 0;
+    }
     fclose(f);
     return 1;
 }
