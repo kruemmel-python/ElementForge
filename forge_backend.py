@@ -437,6 +437,13 @@ def fraction_features(formula: str, vocab: Sequence[str]) -> np.ndarray:
             vec[i] = float(comp[el] / s)
     return vec
 
+def _clean_target(y_raw: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Entfernt NaNs/Inf und gibt nur FINITE y zurück."""
+    y = np.asarray(y_raw, dtype=np.float64).reshape(-1)
+    mask = np.isfinite(y)
+    return y[mask], mask
+
+
 @dataclass(slots=True)
 class Surrogate:
     mu: np.ndarray
@@ -444,18 +451,42 @@ class Surrogate:
     W: np.ndarray
     b: float
 
-def train_surrogate_scalar(Xfrac: np.ndarray, y: np.ndarray) -> Surrogate:
-    X = Xfrac.astype(np.float64, copy=False)
-    y = y.reshape(-1, 1).astype(np.float64, copy=False)
+
+def train_surrogate_scalar(Xfrac: np.ndarray, y_raw: np.ndarray) -> Surrogate:
+    """Lineare Regression (QR), robust gegen NaNs in y."""
+    y_clean, mask = _clean_target(y_raw)
+    if y_clean.size < 2:
+        # fallback: sehr schwaches, nahezu neutrales Modell
+        D = Xfrac.shape[1]
+        mu = Xfrac.mean(axis=0, keepdims=True).astype(np.float32)
+        sigma = (Xfrac.std(axis=0, keepdims=True) + 1e-8).astype(np.float32)
+        return Surrogate(mu, sigma, np.zeros((D,), dtype=np.float32), 0.0)
+
+    X = Xfrac[mask].astype(np.float64, copy=False)
+    y = y_clean.reshape(-1, 1).astype(np.float64, copy=False)
+
     mu = X.mean(axis=0, keepdims=True)
     sigma = X.std(axis=0, keepdims=True) + 1e-8
     Xn = (X - mu) / sigma
+
+    # QR-Lösung, kleinste Quadrate
     X1 = np.c_[Xn, np.ones((Xn.shape[0], 1))]
     Q, R = np.linalg.qr(X1)
-    beta = np.linalg.solve(R, Q.T @ y)
+    beta = np.linalg.solve(R, Q.T @ y)  # (D+1, 1)
+
     W = beta[:-1].astype(np.float32)
     b = float(beta[-1, 0])
     return Surrogate(mu.astype(np.float32), sigma.astype(np.float32), W, b)
+
+
+def safe_train_surrogate_map(df: pd.DataFrame, vocab: list[str], obj_list: list[str]) -> dict[str, Surrogate]:
+    """Baut alle Surrogate; droppt Ziele ohne verwertbare y (nur intern)."""
+    X0 = np.vstack([fraction_features(f, vocab) for f in df["formula"]]).astype(np.float32)
+    sur_map: dict[str, Surrogate] = {}
+    for obj in obj_list:
+        y_raw = pd.to_numeric(df[obj], errors="coerce").to_numpy(np.float32)
+        sur_map[obj] = train_surrogate_scalar(X0, y_raw)
+    return sur_map
 
 def gpu_matmul(cc: CipherCore, A: np.ndarray, B: np.ndarray) -> np.ndarray:
     if cc.has_matmul:
@@ -463,10 +494,17 @@ def gpu_matmul(cc: CipherCore, A: np.ndarray, B: np.ndarray) -> np.ndarray:
     return A.astype(np.float32) @ B.astype(np.float32)
 
 def predict_scalar_gpu(cc: CipherCore, sur: Surrogate, Xfrac: np.ndarray) -> np.ndarray:
+    """Vorhersage y = Xn @ W + b, robust für GPU-Matmul (W als Spaltenvektor)."""
     X = Xfrac.astype(np.float32, copy=False)
     Xn = (X - sur.mu) / sur.sigma
-    out = gpu_matmul(cc, Xn, sur.W) + sur.b
-    return out.ravel().astype(np.float32)
+    W = sur.W.reshape(-1, 1).astype(np.float32)  # <— Spaltenvektor
+    if cc.has_matmul:
+        y = cc.matmul(Xn, W)                      # (N, 1)
+        y = y.reshape(-1)
+    else:
+        y = (Xn @ W).reshape(-1)
+    return (y + sur.b).astype(np.float32)
+
 
 def _renorm_nonneg(v: np.ndarray) -> np.ndarray:
     v = np.clip(v, 0.0, 1.0)
@@ -529,18 +567,26 @@ def _build_knn_neighbors(vocab: list[str], k: int) -> np.ndarray:
 
 # ---- VQE-Fitness-Helfer -----------------------------------------------------
 
-def _props_norm_from_pool_preds(pred_matrix: np.ndarray, obj_list: Sequence[str]) -> list[dict[str, float]]:
+def _props_norm_from_pool_preds(pred_matrix: np.ndarray,
+                                valid_names: Sequence[str]) -> list[dict[str, float]]:
     """
-    pred_matrix: shape (N, M) – Spalten entsprechen obj_list.
-    Rückgabe: N Dictionaries mit normierten Werten je Ziel.
+    pred_matrix: (N, M_valid), Spaltennamen = valid_names
+    Rückgabe: Liste von {name: normierter_wert}
     """
-    props_norm_list: list[dict[str, float]] = []
-    for j in range(pred_matrix.shape[1]):
-        col = normalize01(pred_matrix[:, j])
-        pred_matrix[:, j] = col  # in-place normalisiert
-    for i in range(pred_matrix.shape[0]):
-        props_norm_list.append({obj_list[j]: float(pred_matrix[i, j]) for j in range(pred_matrix.shape[1])})
-    return props_norm_list
+    P = pred_matrix.astype(np.float32, copy=False)
+    # Spaltenweise auf 0..1 normalisieren
+    for j in range(P.shape[1]):
+        col = P[:, j]
+        lo, hi = float(np.nanmin(col)), float(np.nanmax(col))
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            P[:, j] = 0.0
+        else:
+            P[:, j] = (col - lo) / (hi - lo + 1e-8)
+    out: list[dict[str, float]] = []
+    for i in range(P.shape[0]):
+        out.append({valid_names[j]: float(P[i, j]) for j in range(P.shape[1])})
+    return out
+
 
 def _make_terms_from_props(props_norm: dict[str, float], objectives: dict[str, float], num_qubits: int) -> list[PauliZTerm]:
     return _ising_terms_from_objectives(props_norm, objectives, num_qubits)
@@ -555,28 +601,56 @@ def _vec_hash(v: np.ndarray, ndigits: int = 4) -> tuple:
 
 # ---- GA Scoring -------------------------------------------------------------
 
-def score_candidates(cc: CipherCore, sur_map: dict[str, Surrogate], X: np.ndarray,
-                     objectives: Sequence[str], weights: Sequence[float]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def score_candidates(cc: CipherCore,
+                     sur_map: dict[str, Surrogate],
+                     X: np.ndarray,
+                     objectives: Sequence[str],
+                     weights: Sequence[float]
+                     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
     """
     Rückgabe:
-      norm_score: 0..1 aus gewichteten Surrogaten (für Selektion)
-      raw_score:  rohe gewichtete Surrogat-Werte (Monitoring)
-      pred_matrix: NxM vor Normierung (einzelne Ziel-Predictions)
+      norm_score (N,), raw_score (N,), pred_matrix P (N,M_valid), valid_names (M_valid)
     """
-    preds = []
+    preds: list[np.ndarray] = []
+    valid_names: list[str] = []
+
     w = np.asarray(weights if weights else np.ones(len(objectives), dtype=np.float32), dtype=np.float32)
     if w.size != len(objectives):
         w = np.ones((len(objectives),), dtype=np.float32)
     w = w / (float(w.sum()) + 1e-8)
-    for obj in objectives:
+
+    valid_idx: list[int] = []
+    for i, obj in enumerate(objectives):
         if obj not in sur_map:
-            raise KeyError(f"Kein Surrogat für '{obj}'.")
-        preds.append(predict_scalar_gpu(cc, sur_map[obj], X))
-    P = np.stack(preds, axis=1).astype(np.float32)  # NxM
-    raw = (P @ w).astype(np.float32)
-    lo, hi = float(np.min(raw)), float(np.max(raw))
-    norm = (raw - lo) / (hi - lo + 1e-8) if hi > lo else np.zeros_like(raw, dtype=np.float32)
-    return norm, raw, P
+            continue
+        p = predict_scalar_gpu(cc, sur_map[obj], X)
+        if not np.isfinite(p).any():
+            continue
+        preds.append(p.astype(np.float32))
+        valid_idx.append(i)
+        valid_names.append(obj)
+
+    if not preds:
+        N = X.shape[0]
+        return (np.zeros(N, dtype=np.float32),
+                np.zeros(N, dtype=np.float32),
+                np.zeros((N, 0), dtype=np.float32),
+                [])
+
+    P = np.stack(preds, axis=1).astype(np.float32)  # (N, M_valid)
+
+    w_eff = w[valid_idx]
+    w_eff = w_eff / (float(w_eff.sum()) + 1e-8)
+
+    raw = (P @ w_eff).astype(np.float32)
+    lo, hi = float(np.nanmin(raw)), float(np.nanmax(raw))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        norm = np.zeros_like(raw, dtype=np.float32)
+    else:
+        norm = (raw - lo) / (hi - lo + 1e-8)
+
+    return norm, raw, P, valid_names
+
 
 # ---- Basis-Evolution --------------------------------------------------------
 
@@ -618,9 +692,10 @@ def search_new_material(
         if col_map[obj] not in df.columns:
             raise ValueError(f"Zielspalte '{obj}' nicht gefunden (versuchte '{col_map[obj]}').")
 
-    ycols: dict[str, np.ndarray] = {obj: pd.to_numeric(df[col_map[obj]], errors="coerce").to_numpy(np.float32)
-                                    for obj in obj_list}
-    sur_map: dict[str, Surrogate] = {obj: train_surrogate_scalar(X0, ycols[obj]) for obj in obj_list}
+    df_targets = df[["formula"]].copy()
+    for obj in obj_list:
+        df_targets[obj] = df[col_map[obj]]
+    sur_map = safe_train_surrogate_map(df_targets, vocab, obj_list)
 
     own_cc = False
     if cc is None:
@@ -794,10 +869,10 @@ def mycelial_quantum_evolution(
             col_map[obj] = obj
         if col_map[obj] not in df.columns:
             raise ValueError(f"Zielspalte '{obj}' nicht gefunden (versuchte '{col_map[obj]}').")
-    X0 = np.vstack([fraction_features(f, vocab) for f in df["formula"]]).astype(np.float32)
-    ycols: dict[str, np.ndarray] = {obj: pd.to_numeric(df[col_map[obj]], errors="coerce").to_numpy(np.float32)
-                                    for obj in obj_list}
-    sur_map: dict[str, Surrogate] = {obj: train_surrogate_scalar(X0, ycols[obj]) for obj in obj_list}
+    df_targets = df[["formula"]].copy()
+    for obj in obj_list:
+        df_targets[obj] = df[col_map[obj]]
+    sur_map = safe_train_surrogate_map(df_targets, vocab, obj_list)
 
     # 3) CipherCore + Myzel
     cc = CipherCore(dll_path, gpu_index=gpu_index)
@@ -839,71 +914,83 @@ def mycelial_quantum_evolution(
     # 5) Schleife
     for g in range(steps):
         # Surrogat-Bewertung
-        norm_score, raw_score, P_pred = score_candidates(cc, sur_map, pool, obj_list, list(weights or []))
-
-        # Pheromon lesen (für Guidance)
-        pher = cc.mycel_read(layer=0, out_buf=pher_buf)
-        pher_mean = float(np.mean(pher))
-        pher_history_mean.append(pher_mean)
-
-        # Eliten/Eltern
+        norm_score, raw_score, P_pred, valid_names = score_candidates(cc, sur_map, pool, obj_list, list(weights or []))
         elite_n = max(1, int(round(0.25 * population)))
         elite_idx = np.argsort(norm_score)[-elite_n:]
         elites = pool[elite_idx].copy()
-        parents = pool[np.argsort(norm_score)][-max(elite_n * 4, population):]
 
         vqe_eval_count = 0
 
-        # ---------------- VQE in Fitness (optional) ----------------
+        # 3) Optional: VQE-Fitness in kombinierte Fitness mischen
         if use_vqe_fitness and cc.has_vqe and vqe_weight > 0.0:
-            # Normierte objektweise Surrogat-Preds → props_norm je Kandidat
-            props_norm_list = _props_norm_from_pool_preds(P_pred.copy(), obj_list)  # NxM -> [{'obj': norm_val}, ...]
-
-            # Wähle Top-K Eliten (nach Surrogat) für echte VQE
+            props_norm_list = _props_norm_from_pool_preds(P_pred.copy(), valid_names)
             k_eval = int(max(1, min(vqe_elite_k, elites.shape[0])))
-            elite_eval_idx = elite_idx[-k_eval:]  # absolute Indizes im Pool
-
-            # VQE-Energien sammeln
+            elite_eval_idx = elite_idx[-k_eval:]
             energies = np.full(pool.shape[0], np.nan, dtype=np.float32)
 
             for idx in elite_eval_idx:
                 vec = pool[idx]
-                hkey = _vec_hash(vec, ndigits=4)  # Achtung: in _vec_hash wurde 'decimals' gefixt
+                hkey = _vec_hash(vec, ndigits=4)
                 if hkey in vqe_cache:
                     energies[idx] = vqe_cache[hkey]
-                    continue
+                else:
+                    props_norm = props_norm_list[idx] if idx < len(props_norm_list) else {}
+                    terms = _make_terms_from_props(props_norm, {k: float(v) for k, v in zip(obj_list, (weights or [1.0]*len(obj_list)))}, vqe_num_qubits)
+                    if terms:
+                        seed = float(np.dot(vec, np.arange(vec.size, dtype=np.float32)) % 1.0)
+                        params = _default_vqe_params(vqe_num_qubits, vqe_layers, seed=seed)
+                        try:
+                            e = cc.vqe_energy(vqe_num_qubits, vqe_layers, params, terms)
+                            energies[idx] = e
+                            vqe_cache[hkey] = float(e)
+                            vqe_eval_count += 1
+                        except Exception as _e:
+                            pass
 
-                # Hamilton-Terms aus normierten Surrogaten dieses Kandidaten
-                props_norm = props_norm_list[idx]
-                # Wähle Gewichte konsistent zur Gesamtfitness
-                w_for_terms = {k: float(v) for k, v in zip(obj_list, (weights or [1.0] * len(obj_list)))}
-                terms = _make_terms_from_props(props_norm, w_for_terms, vqe_num_qubits)
-                if not terms:
-                    continue
-                # Parameter: deterministische Seed-Wahl aus Vektor
-                seed = float(np.dot(vec, np.arange(vec.size, dtype=np.float32)) % 1.0)
-                params = _default_vqe_params(vqe_num_qubits, vqe_layers, seed=seed)
-                try:
-                    e = cc.vqe_energy(vqe_num_qubits, vqe_layers, params, terms)
-                    energies[idx] = e
-                    vqe_cache[hkey] = float(e)
-                    vqe_eval_count += 1
-                except Exception as e0:
-                    print(f"[VQE-Fitness] Gen{g+1} idx={idx}: {e0}", file=sys.stderr)
-
-            # Normiere nur die berechneten Energien
             eval_mask = np.isfinite(energies)
             if np.any(eval_mask):
                 e_eval = energies[eval_mask]
                 e_norm = (e_eval - float(np.min(e_eval))) / (float(np.max(e_eval) - np.min(e_eval)) + 1e-8)
-                # VQE-Score = 1 - normierte Energie
-                vqe_score = np.zeros_like(energies, dtype=np.float32)
-                vqe_score[eval_mask] = 1.0 - e_norm.astype(np.float32)
-
-                # Kombinierte Fitness: nur dort mischen, wo VQE vorhanden ist
+                vqe_score = np.zeros_like(energies, dtype=np.float32); vqe_score[eval_mask] = 1.0 - e_norm.astype(np.float32)
                 comb = norm_score.copy()
                 comb[eval_mask] = (1.0 - float(vqe_weight)) * norm_score[eval_mask] + float(vqe_weight) * vqe_score[eval_mask]
-                norm_score = comb  # für Selektion/Eliten
+                norm_score = comb
+                # Eliten ggf. neu bestimmen
+                elite_idx = np.argsort(norm_score)[-elite_n:]
+                elites = pool[elite_idx].copy()
+
+        # 4) Pheromon-Verstärkung JETZT berechnen und anwenden
+        elite_scores = norm_score[elite_idx]
+        es = elite_scores - float(np.min(elite_scores))
+        if np.allclose(es.sum(), 0.0):
+            # fallback: gleichmäßige Verstärkung der Eliten
+            es = np.ones_like(elite_scores, dtype=np.float32)
+        es = es / float(es.sum())
+        reinforce = np.average(elites, axis=0, weights=es).astype(np.float32)
+        cc.mycel_reinforce(reinforce)
+        cc.mycel_diffuse_decay()
+
+        # 5) JETZT Pheromon messen (nach Update)
+        if 'pher_buf' not in locals():
+            pher_buf = np.zeros((pool.shape[1],), dtype=np.float32)
+        pher = cc.mycel_read(layer=0, out_buf=pher_buf)
+        pher_history_mean.append(float(np.mean(pher)))
+
+        # 6) Kinder mit Pheromon-Guidance erzeugen
+        parents = pool[np.argsort(norm_score)][-max(elite_n * 4, population):]
+        children: list[np.ndarray] = []
+        while len(children) < (population - elite_n):
+            i, j = np.random.randint(0, parents.shape[0], size=2)
+            pa, pb = parents[i], parents[j]
+            child = crossover_sbx(pa, pb, n=2.0)
+            child = mutate_vec(child, sigma=0.05, strategy="gaussian")
+            child = _apply_pheromone_guidance(child, pher, strength=float(mycel_guidance_strength),
+                                              topk=(int(mycel_topk_bias) if mycel_topk_bias else None))
+            child = _limit_k(child, max_elements)
+            children.append(child)
+        pool = np.vstack([elites] + children)
+
+        pher_mean = float(np.mean(pher))
 
         # Update global best (nach ggf. kombinierter Fitness)
         best_comb = float(np.max(norm_score))
@@ -926,36 +1013,12 @@ def mycelial_quantum_evolution(
         }
         gen_history.append(gen_entry)
 
-        # Verstärkung aus Eliten (verwende *norm_score* für Stabilität)
-        elite_idx = np.argsort(norm_score)[-elite_n:]
-        elites = pool[elite_idx].copy()
-        elite_scores = norm_score[elite_idx]
-        es = elite_scores - float(np.min(elite_scores))
-        es = es / (float(np.sum(es)) + 1e-8)
-        reinforce = np.average(elites, axis=0, weights=es if np.isfinite(es).all() else None).astype(np.float32)
-        cc.mycel_reinforce(reinforce)
-        cc.mycel_diffuse_decay()
-
-        # Kinder mit Pheromon-Guidance
-        children: list[np.ndarray] = []
-        while len(children) < (population - elite_n):
-            i, j = np.random.randint(0, elites.shape[0], size=2)
-            pa = elites[i]; pb = elites[j]
-            child = crossover_sbx(pa, pb, n=2.0)
-            child = mutate_vec(child, sigma=0.05, strategy="gaussian")
-            child = _apply_pheromone_guidance(
-                child, pher, strength=float(mycel_guidance_strength),
-                topk=(int(mycel_topk_bias) if mycel_topk_bias else None)
-            )
-            child = _limit_k(child, max_elements)
-            children.append(child)
-        pool = np.vstack([elites] + children)
-
-        print(f"[Gen {g + 1:02d}] best={best_comb:.3f}  mean={float(np.mean(norm_score)):.3f}  pher_mean={pher_mean:.6f}  vqe_eval={vqe_eval_count}")
+        print(f"[Gen {g + 1:02d}] best={np.max(norm_score):.3f}  mean={np.mean(norm_score):.3f}  pher_mean={pher_history_mean[-1]:.6f}")
 
     # Abschluss – Kandidaten & Tabelle
     final_norm, _, _ = score_candidates(cc, sur_map, pool, obj_list, list(weights or []))
     top_idx = np.argsort(final_norm)[-20:]
+
     candidates: list[np.ndarray] = []
     if global_best_vec is not None:
         candidates.append(global_best_vec)
@@ -980,24 +1043,45 @@ def mycelial_quantum_evolution(
 
     pred_cols: dict[str, np.ndarray] = {}
     for obj in obj_list:
-        pred_cols[f"pred_{obj}"] = predict_scalar_gpu(cc, sur_map[obj], Xcand)
+        try:
+            pred_cols[f"pred_{obj}"] = predict_scalar_gpu(cc, sur_map[obj], Xcand)
+        except KeyError:
+            pred_cols[f"pred_{obj}"] = np.full((Xcand.shape[0],), np.nan, dtype=np.float32)
+
+    # final_norm nochmal für Kandidaten extrahieren
+    cand_scores = []
+    for v in candidates:
+        # einfacher Linear-Score (ohne Re-Norm), nachvollziehbar:
+        s = 0.0
+        for (obj, w) in zip(obj_list, (weights or [1.0]*len(obj_list))):
+            pv = predict_scalar_gpu(cc, sur_map[obj], v.reshape(1,-1))[0]
+            if np.isfinite(pv):
+                s += float(w) * float(pv)
+        cand_scores.append(s)
+    cand_scores = np.asarray(cand_scores, dtype=np.float32)
+
+    # auf 0..1 bringen für Anzeige
+    if np.nanmax(cand_scores) > np.nanmin(cand_scores):
+        show_scores = (cand_scores - np.nanmin(cand_scores)) / (np.nanmax(cand_scores) - np.nanmin(cand_scores))
+    else:
+        show_scores = np.zeros_like(cand_scores, dtype=np.float32)
 
     table = pd.DataFrame({
         "formula_suggested": formulas,
-        "score": final_norm[np.argsort(final_norm)[-len(formulas):][::-1]],
+        "score": show_scores,
         **{k: v for k, v in pred_cols.items()},
-    }).reset_index(drop=True)
+    }).sort_values("score", ascending=False).reset_index(drop=True)
 
     meta = {
         "objectives": obj_list,
         "weights": list(weights or [1.0] * len(obj_list)),
         "runtime_s": time.perf_counter() - t0,
         "gpu": f"index {gpu_index}",
-        "population": int(population),
-        "steps": int(steps),
-        "vocab_size": int(vocab_size),
-        "max_elements": int(max_elements),
-        "gen_history": gen_history,                     # <-- PATCH: voll befüllt
+        "population": population,
+        "steps": steps,
+        "vocab_size": vocab_size,
+        "max_elements": max_elements,
+        "gen_history": gen_history,
         "pheromone_history": [float(x) for x in pher_history_mean],
         "mycel_params": {
             "guidance": float(mycel_guidance_strength),
