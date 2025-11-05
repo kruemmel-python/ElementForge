@@ -50,6 +50,8 @@
 #include "CipherCore_NoiseCtrl.h"
 #include "SymBio_Interface.h"
 
+const char* clGetErrorString(cl_int error);
+
 // --- Platform Specific Defines ---
 #ifndef M_PI
 /** @brief Definition of PI if not already defined. */
@@ -1063,7 +1065,6 @@ cl_int compile_opencl_kernel_variant(const char* kernel_source, const char* kern
 cl_int compile_opencl_kernel_dual(const char* kernel_source, const char* kernel_name,
                                   cl_program* strict_program_out, cl_kernel* strict_kernel_out,
                                   cl_program* fast_program_out, cl_kernel* fast_kernel_out);
-const char* clGetErrorString(cl_int error);
 int submit_kernel_command(int gpu_index, GPUCommand command, void *data);
 int finish_queue_and_check(int gpu_index, const char* func_name);
 void shutdown_driver();
