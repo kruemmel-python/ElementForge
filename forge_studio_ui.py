@@ -7,11 +7,11 @@ UI für:
 A) Element-Bewertung (klassisch + Quantum/VQE)
 B) Material-Synthese (Evolution) mit *echter* Myzel-Guidance
    + optionaler VQE-Einbindung in die Fitness (Top-Eliten pro Generation)
+C) Diagnostik (GA-, Myzel- und Surrogat-Health)
 
 Start:
   streamlit run forge_studio_ui.py
 """
-
 from __future__ import annotations
 
 import numpy as np
@@ -24,10 +24,8 @@ warnings.filterwarnings("ignore", message=r".*multiple allotropes.*", category=U
 
 import forge_backend as forge
 
-
 # -------------------------------------------------------------------
-# Konstante Listen: „freundliche“ Properties je Kontext
-# (Schlüssel = Backend-Name, Label = UI-Name)
+# „freundliche“ Properties je Kontext (Key = Backend-Name)
 # -------------------------------------------------------------------
 ELEMENT_PROPS: Dict[str, str] = {
     "density": "Dichte (density)",
@@ -41,22 +39,16 @@ ELEMENT_PROPS: Dict[str, str] = {
 }
 
 MATERIAL_PROPS: Dict[str, str] = {
-    # Wichtig: Keys müssen zu forge_backend passen (score/search)
     "bandgap": "Bandlücke (bandgap)",
     "formation_energy": "Bildungsenergie/Atom (formation_energy)",
     "density": "Dichte (density)",
-    # Du kannst hier weitere Ziele ergänzen, wenn dein Datensatz sie hat:
+    # ggf. erweitern, wenn im Datensatz vorhanden:
     # "bulk_modulus": "Bulkmodul (bulk_modulus)",
     # "shear_modulus": "Schermodul (shear_modulus)",
 }
 
-
 # -------------------------------------------------------------------
 # Ziel-Builder: klickbare Auswahl + Gewichte
-#   - available: Dict[key->label]
-#   - state_key: eindeutiger Schlüssel für st.session_state
-#   - presets: Liste von Presets (Name -> Dict[key->weight])
-# Rückgabe: Dict[str, float] (objective->weight)
 # -------------------------------------------------------------------
 def objective_builder(
     title: str,
@@ -65,44 +57,41 @@ def objective_builder(
     state_key: str,
     presets: Dict[str, Dict[str, float]] | None = None,
 ) -> Dict[str, float]:
-    # Session-Initialisierung
+    st.subheader(title)
+
+    # Session-Init
     if state_key not in st.session_state:
-        st.session_state[state_key] = {}  # {prop_key: weight}
+        st.session_state[state_key] = {}
 
     # Presets
     if presets:
         cols = st.columns(min(4, len(presets)))
         for i, (pname, pobj) in enumerate(presets.items()):
-            if cols[i % len(cols)].button(f"Preset: {pname}", use_container_width=True):
-                # Ersetzt aktuelle Auswahl mit dem Preset
+            if cols[i % len(cols)].button(f"Preset: {pname}", use_container_width=True, key=f"{state_key}_preset_{pname}"):
                 st.session_state[state_key] = dict(pobj)
 
-    # Multiselect der verfügbaren Eigenschaften
+    # Auswahl
     current_keys: List[str] = list(st.session_state[state_key].keys())
     selected = st.multiselect(
         "Ziele auswählen",
         options=list(available.keys()),
         format_func=lambda k: available[k],
         default=current_keys or None,
-        help=(
-            "Wähle die Eigenschaften aus, die optimiert/bewertet werden sollen. "
-            "Positive Gewichte bedeuten 'maximieren', negative 'minimieren'."
-        ),
+        help="Positive Gewichte = maximieren, negative = minimieren.",
+        key=f"{state_key}_select",
     )
 
-    # Entfernte Keys aus dem State räumen
+    # Entfernte Keys räumen
     for k in list(st.session_state[state_key].keys()):
         if k not in selected:
             st.session_state[state_key].pop(k, None)
 
-    # Für neu ausgewählte Keys Standardgewicht setzen
+    # Neu hinzugefügte Keys initialisieren
     for k in selected:
         if k not in st.session_state[state_key]:
-            # Heuristik: bei bekannten Minimierungszielen negativ starten
-            default_w = -1.0 if k in {"formation_energy"} else 1.0
-            st.session_state[state_key][k] = float(default_w)
+            st.session_state[state_key][k] = float(-1.0 if k in {"formation_energy"} else 1.0)
 
-    # Für jede ausgewählte Eigenschaft Gewicht eingeben lassen
+    # Gewichte editieren
     if selected:
         st.markdown("**Gewichte je Ziel**  \n(>0 = maximieren, <0 = minimieren; Mischung möglich)")
         for k in selected:
@@ -117,7 +106,6 @@ def objective_builder(
                     value=float(st.session_state[state_key][k]),
                     step=0.1,
                     format="%.2f",
-                    help="Beispiele: 1.0 (stark maximieren), -0.5 (leicht minimieren), 0.0 (neutral)",
                 )
                 st.session_state[state_key][k] = float(w)
             with cols[2]:
@@ -129,6 +117,20 @@ def objective_builder(
 
     return dict(st.session_state[state_key])
 
+# -------------------------------------------------------------------
+# Caching-Helfer (beschleunigt Diagnostik-Surrogat)
+# -------------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def _cached_load_df(dataset: str) -> pd.DataFrame:
+    return forge.load_jarvis_dataframe(dataset)
+
+@st.cache_data(show_spinner=False)
+def _cached_vocab(df: pd.DataFrame, max_elems: int) -> list[str]:
+    return forge.build_vocab(df, max_elems=max_elems)
+
+@st.cache_data(show_spinner=False)
+def _cached_surrogates(df: pd.DataFrame, vocab: list[str], obj_list: list[str]) -> dict[str, forge.Surrogate]:
+    return forge.safe_train_surrogate_map(df[["formula"] + obj_list], vocab, obj_list)
 
 # -------------------------------------------------------------------
 # Layout
@@ -142,39 +144,27 @@ with st.sidebar:
     dll_path = st.text_input("DLL-Pfad", value=forge.autodetect_dll())
     gpu_index = st.number_input("GPU-Index", min_value=0, value=0, step=1)
 
-tabA, tabB = st.tabs(["A) Elemente bewerten", "B) Neues Material entwerfen"])
-
+tabA, tabB, tabC = st.tabs([
+    "A) Elemente bewerten",
+    "B) Neues Material entwerfen",
+    "C) Diagnostik",
+])
 
 # ===================================================================
 # TAB A – Elemente
 # ===================================================================
 with tabA:
     st.header("A) Bewertung realer Elemente")
-    st.markdown(
-        "Wähle die **Eigenschaften** und setze **Gewichte**: "
-        "_positiv = maximieren_, _negativ = minimieren_."
-    )
+    st.markdown("Wähle die **Eigenschaften** und setze **Gewichte**: _positiv = maximieren_, _negativ = minimieren_.")
 
-    # Presets für Elemente
     element_presets = {
         "Leicht & schmelzstark": {"density": -1.0, "melting_point": 1.0},
         "Reaktiv & leicht": {"electronegativity_pauling": 1.0, "density": -0.5},
         "Hitzebeständig": {"melting_point": 1.0, "boiling_point": 0.5},
     }
+    objectives_A = objective_builder("Ziele (Eigenschaft: Gewicht)", ELEMENT_PROPS, state_key="obj_builder_A", presets=element_presets)
 
-    objectives_A = objective_builder(
-        "Ziele (Eigenschaft: Gewicht)",
-        ELEMENT_PROPS,
-        state_key="obj_builder_A",
-        presets=element_presets,
-    )
-
-    mode_A = st.radio(
-        "Berechnungsmodus",
-        ["Klassisch (Einzigartigkeit)", "Quantum (VQE)"],
-        horizontal=True,
-        key="mode_A",
-    )
+    mode_A = st.radio("Berechnungsmodus", ["Klassisch (Einzigartigkeit)", "Quantum (VQE)"], horizontal=True, key="mode_A")
 
     if "Klassisch" in mode_A:
         uniq_w = st.slider("Gewichtung Einzigartigkeit (α)", 0.0, 1.0, 0.3, 0.05, key="uniq_w")
@@ -216,30 +206,19 @@ with tabA:
             mime="text/csv",
         )
 
-
 # ===================================================================
 # TAB B – Material-Synthese (Myzel + VQE)
 # ===================================================================
 with tabB:
     st.header("B) Evolutionäre Material-Synthese (Myzel + VQE-Fitness optional)")
-    st.markdown(
-        "Wähle **Materialziele** (Datensatzabhängig). "
-        "Gewichte: _positiv = maximieren_, _negativ = minimieren_."
-    )
+    st.markdown("Wähle **Materialziele**. Gewichte: _positiv = maximieren_, _negativ = minimieren_.")
 
-    # Presets für Materialien
     material_presets = {
         "Halbleiter-Fokus": {"bandgap": 1.0, "formation_energy": -1.0, "density": 0.3},
         "Strukturell leicht": {"density": -1.0, "formation_energy": -0.5},
         "Energie-stabil": {"formation_energy": -1.0},
     }
-
-    objectives_B = objective_builder(
-        "Ziele (Eigenschaft: Gewicht)",
-        MATERIAL_PROPS,
-        state_key="obj_builder_B",
-        presets=material_presets,
-    )
+    objectives_B = objective_builder("Ziele (Eigenschaft: Gewicht)", MATERIAL_PROPS, state_key="obj_builder_B", presets=material_presets)
 
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -275,7 +254,7 @@ with tabB:
         topk_bias = st.number_input("Top-k Bias (Pheromon Fokus, 0=aus)", min_value=0, max_value=64, value=0, step=1)
 
     st.markdown("---")
-    st.subheader("🧪 VQE direkt in die Fitness einmischen (GPU)")
+    st.subheader("⚛️ VQE direkt in die Fitness einmischen (GPU)")
     use_vqe_fit = st.checkbox("VQE-Fitness aktivieren", value=True)
     c12, c13, c14, c15 = st.columns(4)
     with c12:
@@ -353,3 +332,142 @@ with tabB:
                 f"γ={vf.get('weight')} • Top-K={vf.get('elite_k')} • "
                 f"Q={vf.get('num_qubits')} • L={vf.get('layers')} • Cache={vf.get('cache_size')}"
             )
+
+# ===================================================================
+# TAB C – Diagnostik
+# ===================================================================
+with tabC:
+    st.header("C) Diagnostik")
+    st.markdown(
+        "Hier siehst du **Trainings- und Laufmetriken** (pro Generation) sowie einen **Surrogat-Gesundheitscheck** "
+        "für die aktuell gewählten Materialziele."
+    )
+
+    # --- 1) GA-/Myzel-/VQE-Metriken aus meta['gen_history'] ---
+    meta = st.session_state.get("meta_materials", {})
+    gen_hist = meta.get("gen_history", None)
+
+    if gen_hist:
+        st.subheader("📈 Generationsmetriken")
+        gh = pd.DataFrame(gen_hist)
+        c1, c2 = st.columns(2)
+        with c1:
+            if {"gen", "best_norm", "mean_norm"} <= set(gh.columns):
+                chart_df = gh.set_index("gen")[["best_norm", "mean_norm"]]
+                st.line_chart(chart_df, height=240)
+            else:
+                st.info("Noch keine Norm-Score-Metriken verfügbar.")
+
+        with c2:
+            cols = [c for c in ["pheromone_mean", "vqe_eval", "vqe_cache_size"] if c in gh.columns]
+            if cols:
+                st.line_chart(gh.set_index("gen")[cols], height=240)
+            else:
+                st.info("Noch keine Myzel-/VQE-Metriken verfügbar.")
+
+        with st.expander("Rohdaten (gen_history)"):
+            st.dataframe(gh, use_container_width=True, height=320)
+            st.download_button(
+                "⤓ gen_history.csv",
+                data=gh.to_csv(index=False).encode("utf-8"),
+                file_name="gen_history.csv",
+                mime="text/csv",
+            )
+    else:
+        st.info("Keine Generationsmetriken gefunden. Starte eine Synthese in Tab B.")
+
+    st.markdown("---")
+
+    # --- 2) Surrogat-Gesundheitscheck ---
+    st.subheader("🩺 Surrogat-Gesundheitscheck (aktueller Datensatz & Ziele)")
+
+    # Nimmt die aktuellen Einstellungen aus Tab B
+    dataset = st.session_state.get("dataset_B_sel", None) or st.session_state.get("dataset_B", "dft_3d")
+    # falls nicht gesetzt: nimm den im UI-Feld aktuell sichtbaren Default
+    dataset = dataset if isinstance(dataset, str) else "dft_3d"
+
+    objectives_cur = st.session_state.get("obj_builder_B", {})
+    if not objectives_cur:
+        st.info("Keine Materialziele gewählt (Tab B). Wähle Ziele, dann hier aktualisieren.")
+    else:
+        with st.spinner("Trainiere Surrogate für Diagnostik …"):
+            try:
+                df = _cached_load_df(dataset)
+                vocab = _cached_vocab(df, max_elems=int(st.session_state.get("vocab_B", 32) or 32))
+                obj_list = list(objectives_cur.keys())
+
+                # Spaltennamen auf Datensatz abbilden wie im Backend (vereinfachend: direkt probieren)
+                df_targets = df[["formula"]].copy()
+                col_map = {}
+                for obj in obj_list:
+                    lo = obj.lower()
+                    if lo == "bandgap":
+                        col = "mbj_bandgap" if "mbj_bandgap" in df.columns else "bandgap"
+                    elif lo == "formation_energy":
+                        col = "formation_energy_peratom" if "formation_energy_peratom" in df.columns else "formation_energy"
+                    else:
+                        col = obj
+                    if col not in df.columns:
+                        col_map[obj] = None
+                    else:
+                        col_map[obj] = col
+                        df_targets[obj] = df[col]
+
+                # Nur wirklich vorhandene Ziele trainieren
+                trainable = [o for o in obj_list if col_map.get(o)]
+                if not trainable:
+                    st.warning("Keine passenden Zielspalten im Datensatz gefunden.")
+                else:
+                    sur_map = forge.safe_train_surrogate_map(df_targets, vocab, trainable)
+
+                    # Kennzahlen je Ziel
+                    rows = []
+                    N = len(df_targets)
+                    for obj in obj_list:
+                        col = col_map.get(obj)
+                        if not col:
+                            rows.append({
+                                "objective": obj,
+                                "status": "Spalte fehlt",
+                                "valid_count": 0,
+                                "nan_rate": 1.0,
+                                "||W||₂": np.nan,
+                                "bias b": np.nan,
+                            })
+                            continue
+                        y = pd.to_numeric(df_targets[obj], errors="coerce").to_numpy(dtype=np.float64)
+                        valid = np.isfinite(y)
+                        valid_count = int(np.sum(valid))
+                        nan_rate = float(1.0 - valid_count / max(1, N))
+
+                        if obj in sur_map:
+                            s = sur_map[obj]
+                            w_norm = float(np.linalg.norm(s.W.astype(np.float64)))
+                            b = float(s.b)
+                            status = "OK"
+                        else:
+                            w_norm, b, status = np.nan, np.nan, "nicht trainiert"
+
+                        rows.append({
+                            "objective": obj,
+                            "status": status,
+                            "valid_count": valid_count,
+                            "nan_rate": round(nan_rate, 4),
+                            "||W||₂": round(w_norm, 6) if np.isfinite(w_norm) else np.nan,
+                            "bias b": round(b, 6) if np.isfinite(b) else np.nan,
+                        })
+
+                    diag_df = pd.DataFrame(rows)
+                    st.dataframe(diag_df, use_container_width=True, height=280)
+                    st.download_button(
+                        "⤓ surrogate_health.csv",
+                        data=diag_df.to_csv(index=False).encode("utf-8"),
+                        file_name="surrogate_health.csv",
+                        mime="text/csv",
+                    )
+                    st.caption(
+                        "Hinweis: Hohe **nan_rate** bedeutet viele fehlende Werte im Datensatz. "
+                        "**||W||₂≈0** deutet auf schwaches/unsicheres Surrogat hin."
+                    )
+            except Exception as e:
+                st.exception(e)
