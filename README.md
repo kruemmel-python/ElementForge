@@ -1,251 +1,208 @@
-# 🧠 Forge Studio – Myzel-Quanten-Evolution mit GPU-Beschleunigung
 
-> **Autor:** Ralf Krümmel  
-> **Version:** 1.0 (Stand: 05.11.2025)  
-> **Lizenz:** Open Research License  
-> **Sprache:** Deutsch  
 
----
 
-## 🌍 Übersicht
 
-**Forge Studio** ist eine interaktive GPU-Anwendung zur Entdeckung neuer Materialien auf Basis evolutionärer Algorithmen.  
-Das System kombiniert:
+# Forge Studio: Industrial Formulation Engine
 
-- **Surrogatmodelle** (lineare physikalische Approximationen)  
-- **Myzel-Netzwerke** (graphenbasierte Feldsimulation)  
-- **Quanteninspirierte Fitness-Bewertung (VQE)**  
+[![Lizenz: MIT](https://img.shields.io/badge/Lizenz-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python-Version](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![Streamlit](https://img.shields.io/badge/gebaut%20mit-Streamlit-red.svg)](https://streamlit.io)
 
-Die extreme Rechenleistung stammt vom maßgeschneiderten OpenCL-Treiber  
-🧩 **`CC_OpenCl.dll` / `CipherCore`**, der sämtliche Kernoperationen auf der GPU ausführt.
+**GPU-beschleunigte Rezepturoptimierung für die Materialwissenschaft und Industrie mittels eines evolutionären Algorithmus, geleitet durch ein Mycelial Prototype Graph (MPG) Surrogatmodell.**
 
 ---
 
-## ⚙️ Systemarchitektur
+## Inhaltsverzeichnis
+
+1.  [Über das Projekt](#über-das-projekt)
+2.  [Kernkonzepte](#kernkonzepte)
+    *   [CipherCore OpenCL Treiber (DLL)](#ciphercore-opencl-treiber-dll)
+    *   [Mycelial Prototype Graph (MPG) Modell](#mycelial-prototype-graph-mpg-modell)
+    *   [Evolutionärer Algorithmus](#evolutionärer-algorithmus)
+3.  [Architektur](#architektur)
+4.  [Installation und Einrichtung](#installation-und-einrichtung)
+    *   [Voraussetzungen](#voraussetzungen)
+    *   [Schritt-für-Schritt-Anleitung](#schritt-für-schritt-anleitung)
+5.  [Anwendung und Nutzung](#anwendung-und-nutzung)
+    *   [Starten der Anwendung](#starten-der-anwendung)
+    *   [Konfiguration eines Optimierungslaufs](#konfiguration-eines-optimierungslaufs)
+6.  [Fallstudie: Von Fehlern zur erfolgreichen Optimierung](#fallstudie-von-fehlern-zur-erfolgreichen-optimierung)
+    *   [Phase 1: Technische Fehlerbehebung](#phase-1-technische-fehlerbehebung)
+    *   [Phase 2: Das "kollabierte Modell"](#phase-2-das-kollabierte-modell)
+    *   [Phase 3: Verfeinerung der Bewertungslogik](#phase-3-verfeinerung-der-bewertungslogik)
+    *   [Phase 4: Der Durchbruch durch "Constrained Optimization"](#phase-4-der-durchbruch-durch-constrained-optimization)
+    *   [Finale Testergebnisse](#finale-testergebnisse)
+7.  [Glossar](#glossar)
+8.  [Mitwirken](#mitwirken)
+9.  [Lizenz](#lizenz)
+
+## Über das Projekt
+
+**Forge Studio** ist ein Framework zur Entdeckung und Optimierung von industriellen Rezepturen und neuen Materialien. Anstatt auf langwierige und teure Laborexperimente zu setzen, nutzt dieses Projekt einen datengesteuerten Ansatz, um den Suchraum potenzieller Materialkombinationen effizient zu durchsuchen.
+
+Das Herzstück des Systems ist eine Kombination aus drei Schlüsseltechnologien:
+
+1.  **GPU-Beschleunigung:** Ein maßgeschneiderter C-Treiber (`CipherCore_OpenCl.dll`), der über OpenCL direkt mit der Grafikkarte kommuniziert, um massive Parallelberechnungen durchzuführen. Dies beschleunigt den Optimierungsprozess um Größenordnungen im Vergleich zu reinen CPU-Implementierungen.
+2.  **Surrogatmodellierung (MPG):** Ein "Mycelial Prototype Graph"-Modell wird auf existierenden Daten trainiert, um die Eigenschaften neuer, hypothetischer Materialien blitzschnell vorherzusagen, ohne dass eine teure Simulation oder ein Labortest erforderlich ist.
+3.  **Evolutionäre Algorithmen:** Inspiriert von der biologischen Evolution, erzeugt und verbessert ein genetischer Algorithmus Generationen von "Rezepturen", um die besten Kandidaten zu finden, die den vom Benutzer definierten Zielen (z.B. hohe Stabilität, große Bandlücke) entsprechen.
+
+## Kernkonzepte
+
+### CipherCore OpenCL Treiber (DLL)
+
+Die `CipherCore_OpenCl.dll` (oder `.so`/`.dylib` auf Linux/macOS) ist das Fundament der hohen Performance von Forge Studio. Diese in C geschriebene Bibliothek:
+
+*   **Initialisiert die GPU:** Sie erkennt OpenCL-fähige Grafikkarten und stellt eine Verbindung her.
+*   **Kompiliert Kernel:** Spezialisierte C-Programme (Kernel) für Aufgaben wie Matrixmultiplikation, Clustering und Simulation werden zur Laufzeit für die spezifische GPU-Architektur kompiliert.
+*   **Verwaltet den Speicher:** Sie kümmert sich um das Zuweisen von Speicher auf der GPU und das schnelle Kopieren von Daten zwischen CPU und GPU.
+*   **Stellt eine C-API bereit:** Python kommuniziert über das `ctypes`-Modul mit dieser Bibliothek, um Hochleistungsberechnungen anzustoßen.
+
+### Mycelial Prototype Graph (MPG) Modell
+
+Das MPG-Modell ist ein Surrogatmodell, das lernt, die Ergebnisse teurer Experimente oder Simulationen zu approximieren.
+
+*   **Prototype Graph:** Das Modell lernt eine Reihe von "Prototypen" – ideale Repräsentanten für bestimmte Materialcluster (z.B. "stabile Oxide mit kleiner Dichte"). Wenn eine neue Rezeptur bewertet wird, wird sie mit diesen Prototypen verglichen. Ihre Eigenschaften werden dann aus einer gewichteten Kombination der Eigenschaften der nächstgelegenen Prototypen abgeleitet.
+*   **Mycelial Guidance:** Der "myzeliale" Aspekt bezieht sich auf das Pheromon-System, das den evolutionären Algorithmus leitet. Wie ein Pilzmyzel, das Nährstoffe im Boden findet, hinterlässt der Algorithmus "Pheromonspuren" in den vielversprechenden Bereichen des Suchraums. Die `Guidance-Stärke` steuert, wie stark sich neue Generationen von diesen Spuren anziehen lassen.
+
+### Evolutionärer Algorithmus
+
+Der Optimierungsprozess ist ein genetischer Algorithmus:
+
+1.  **Initialisierung:** Eine zufällige "Population" von Kandidaten-Rezepturen wird erstellt.
+2.  **Bewertung (Fitness):** Das MPG-Modell sagt die Eigenschaften jedes Kandidaten voraus. Eine Bewertungsfunktion (`score_formulations`) berechnet einen "Fitness-Score" basierend auf den vom Benutzer gesetzten Zielen.
+3.  **Selektion:** Die besten Kandidaten ("Eliten") werden für die nächste Generation ausgewählt.
+4.  **Reproduktion:** Neue Kandidaten ("Kinder") werden durch `Crossover` (Kombination zweier Eltern) und `Mutation` (zufällige kleine Änderungen) erzeugt.
+5.  **Wiederholung:** Der Prozess wird über Hunderte von Generationen wiederholt, wobei sich die Population schrittweise in Richtung optimaler Lösungen entwickelt.
+
+## Architektur
+
+Das Projekt ist in drei klare Schichten unterteilt:
+
+1.  **Präsentationsschicht (`forge_studio_ui.py`):** Eine interaktive Web-Benutzeroberfläche, die mit Streamlit erstellt wurde. Sie ermöglicht die Konfiguration der Optimierung und die Visualisierung der Ergebnisse.
+2.  **Logikschicht (`forge_backend.py`):** Das Python-Herzstück. Es implementiert den evolutionären Algorithmus, steuert den Trainingsprozess des MPG-Modells und fungiert als Brücke zur C-Bibliothek.
+3.  **Compute-Schicht (`CipherCore_OpenCl.dll`):** Die in C geschriebene High-Performance-Bibliothek, die alle rechenintensiven Aufgaben auf der GPU ausführt.
 
 ```
-
-[ Streamlit UI ]
-│
-▼
-[ forge_backend.py ]
-│
-▼
-[ CipherCore_OpenCL Treiber ]
-│
-┌────┴────┐
-│  GPU-Compute  │
-└───────────┘
-
-````
-
-| Komponente | Aufgabe |
-|-------------|----------|
-| **forge_studio_ui.py** | Streamlit-Frontend zur Steuerung, Visualisierung & Diagnose |
-| **forge_backend.py** | Kernlogik der evolutionären Myzel- und VQE-Prozesse |
-| **CC_OpenCl.dll / libCC_OpenCl.so** | GPU-Treiber mit OpenCL-Kernen für MatMul, Myzel, VQE |
-| **datasets/** | Enthält vorbereitete Materialdaten (z. B. JARVIS 3D-Datenbank) |
-
----
-
-## 💻 Installation
-
-### 1️⃣ Voraussetzungen
-
-- **Python ≥ 3.12**
-- **OpenCL-fähige GPU** (AMD, Intel, NVIDIA)
-- **Windows 10/11** oder **Ubuntu 20.04+**
-- Compiler & Treiber installiert (z. B. AMD APP SDK oder ROCm / CUDA-Runtime)
-
----
-
-### 2️⃣ Virtuelle Umgebung anlegen
-
-```bash
-python -m venv .venv
-source .venv/bin/activate      # Linux/macOS
-.venv\Scripts\activate         # Windows
-````
-
----
-
-### 3️⃣ Abhängigkeiten installieren
-
-> Falls du ein `requirements.txt` nutzt, kann dieser Block direkt kopiert werden.
-
-```bash
-pip install -r requirements.txt
+[ UI (Streamlit) ] <--> [ Python Backend (Logik) ] <--> [ CipherCore DLL (C/OpenCL) ] <--> [ GPU ]
 ```
 
-**requirements.txt**
+## Installation und Einrichtung
 
-```
-streamlit>=1.39
-numpy>=1.26
-pandas>=2.2
-scipy>=1.14
-typer>=0.12
-tqdm>=4.66
-plotly>=5.23
-requests>=2.32
-pyopencl>=2024.2
-```
+### Voraussetzungen
 
----
+*   Python 3.10 oder höher
+*   Ein C/C++ Compiler (z.B. GCC/Clang auf Linux, MSVC auf Windows)
+*   Aktuelle Treiber für eine OpenCL 1.2+ fähige GPU (NVIDIA, AMD, Intel)
+*   Git zur Versionskontrolle
 
-### 4️⃣ GPU-Treiber aktivieren
+### Schritt-für-Schritt-Anleitung
 
-Lege die Datei
-📦 `CC_OpenCl.dll` (Windows) oder `libCC_OpenCl.so` (Linux)
-in das Projekt-Hauptverzeichnis.
+1.  **Repository klonen:**
+    ```bash
+    git clone <repository-url>
+    cd <repository-name>
+    ```
 
-Teste die Verbindung:
+2.  **Python-Abhängigkeiten installieren:**
+    ```bash
+    pip install -r requirements.txt
+    ```
 
-```bash
-python - <<'PY'
-import ctypes
-dll = ctypes.CDLL("./CC_OpenCl.dll")
-print("✅ DLL geladen:", dll)
-PY
-```
+3.  **CipherCore DLL kompilieren:**
+    Navigieren Sie in das Verzeichnis, das den C-Quellcode (`opencl_driver.c`) enthält.
 
----
+    *   **Unter Linux/macOS (mit GCC/Clang):**
+        ```bash
+        # Der -I Pfad muss möglicherweise an Ihr System angepasst werden
+        gcc -shared -o CipherCore_OpenCl.so -fPIC opencl_driver.c -lOpenCL
+        ```
 
-### 5️⃣ Anwendung starten
+    *   **Unter Windows (mit MSVC in einer Developer Command Prompt):**
+        ```bash
+        # 'path\to\opencl\sdk' anpassen
+        cl /LD opencl_driver.c -I"path\to\opencl\sdk\include" "path\to\opencl\sdk\lib\OpenCL.lib" /FeCipherCore_OpenCl.dll
+        ```    > **Wichtig:** Stellen Sie sicher, dass die kompilierte DLL (`CipherCore_OpenCl.dll` oder `.so`) im Hauptverzeichnis des Projekts liegt, damit sie von `autodetect_dll()` gefunden wird.
 
-```bash
-streamlit run forge_studio_ui.py
-```
+4.  **Anwendung starten:**
+    ```bash
+    streamlit run forge_studio_ui.py
+    ```
 
-Die App öffnet sich unter
-👉 `http://localhost:8501`
+## Anwendung und Nutzung
 
----
+### Starten der Anwendung
 
-## 🧩 Hauptkomponenten
+Nach dem Start öffnet sich automatisch ein Browserfenster mit der Forge Studio UI unter `http://localhost:8501`.
 
-### 🔹 CipherCore-Treiber (`CC_OpenCl.dll`)
+### Konfiguration eines Optimierungslaufs
 
-Der OpenCL-Treiber übernimmt sämtliche rechenintensiven Aufgaben:
+1.  **Problem auswählen:** Wählen Sie ein vordefiniertes Optimierungsproblem aus, z.B. "Stabile Halbleiter (Materials Project)".
+2.  **Ziele definieren:** Wählen Sie die Materialeigenschaften aus, die Sie optimieren möchten (z.B. `Bandlücke`, `Bildungsenergie`). Weisen Sie Gewichte zu: positive Werte für Maximierung, negative für Minimierung.
+3.  **Datenquelle konfigurieren:** Geben Sie für das Materials Project einen gültigen API-Schlüssel und eine chemische Systemabfrage (z.B. `*-O` für alle Oxide) an.
+4.  **Simulations-Parameter einstellen:**
+    *   **Population:** Anzahl der Kandidaten pro Generation (empfohlen: 512+).
+    *   **Generationen:** Dauer der Suche (empfohlen: 100+).
+    *   **Anzahl Prototypen:** Komplexität des MPG-Modells (empfohlen: 256+ für komplexe Probleme).
+5.  **Myzel-Parameter anpassen:**
+    *   **Guidance-Stärke:** Steuert die Balance zwischen Erkundung (niedrige Werte) und Ausnutzung (hohe Werte). Ein guter Startwert ist `0.1-0.2`.
+6.  **Synthese starten:** Klicken Sie auf "Synthese starten", um den GPU-beschleunigten Lauf zu beginnen. Die Ergebnisse werden live in der Konsole und nach Abschluss in der UI angezeigt.
 
-| Kategorie               | Funktionen                                                                           |
-| ----------------------- | ------------------------------------------------------------------------------------ |
-| **GPU-Verwaltung**      | `initialize_gpu()`, `shutdown_gpu()`, `allocate_gpu_memory()`                        |
-| **Matrix-Kerne**        | `execute_matmul_on_gpu()` – schnelle Surrogat-Vorhersagen                            |
-| **Myzel-Kerne**         | `subqg_init_mycel()`, `step_pheromone_reinforce()`, `step_pheromone_diffuse_decay()` |
-| **Quanten-Kerne (VQE)** | `execute_vqe_gpu()` – Berechnung von Energie-Erwartungswerten                        |
+## Fallstudie: Von Fehlern zur erfolgreichen Optimierung
 
-🧠 Die Myzel-Kerne simulieren ein selbstorganisierendes Feld aus „Pheromonen“, das erfolgreiche Kandidaten verstärkt und neue Formeln in Richtung vielversprechender Strukturen lenkt.
+Die Entwicklung dieses Projekts war eine iterative Reise, die typische Herausforderungen bei der Kombination von Hardware-Beschleunigung und maschinellem Lernen widerspiegelt.
 
----
+#### Phase 1: Technische Fehlerbehebung
 
-### 🔹 Backend-Logik (`forge_backend.py`)
+Die ersten Hürden waren rein technischer Natur:
+*   **DLL-Ladefehler:** Sicherstellen, dass die C-Bibliothek korrekt kompiliert und vom Python-Skript gefunden wird.
+*   **Python-Fehler:** Behebung von `NameError`, `TypeError` und `SyntaxError` aufgrund fehlender Imports, falscher Funktionsaufrufe und Tippfehlern in der evolutionären Logik.
 
-Der Python-Kern implementiert:
+#### Phase 2: Das "kollabierte Modell"
 
-1. **Initialisierung**
+Nachdem die technischen Fehler behoben waren, zeigten die ersten Läufe ein trügerisches Bild: Der Score sprang sofort auf 1.0, aber die Vorhersagen waren für alle Kandidaten identisch.
+*   **Problem:** Das MPG-Modell war "unterangepasst". Es lernte nur den Durchschnittswert der Trainingsdaten und war nicht komplex genug, um auf Variationen in den Eingabedaten zu reagieren.
+*   **Lösung:** Erhöhung der Trainingsdaten durch breitere Abfragen (`*-O`) und Hinzufügen aussagekräftigerer Features (`formation_energy_per_atom`).
 
-   * Laden der Datensätze (JARVIS)
-   * Training linearer Surrogatmodelle
-   * Aufbau des Myzelnetzwerks
+#### Phase 3: Verfeinerung der Bewertungslogik
 
-2. **Evolutionäre Schleife**
+Die nächste Herausforderung war eine zu "flache" oder "steile" Bewertungslandschaft.
+*   **Problem:** Eine harte "Straf-Klippe" in der `score_formulations`-Funktion (z.B. Score = -999 bei `e_above_hull > 0.1`) machte es dem Algorithmus unmöglich, sich schrittweise zu verbessern.
+*   **Lösung:** Umwandlung der harten Strafen in "sanfte Rampen", die eine kontinuierliche Bewertung ermöglichen.
 
-   * Bewertung aller Kandidaten (Fitness)
-   * Selektion & Verstärkung
-   * Diffusion & Zerfall im Myzel
-   * Reproduktion (Mutation/Crossover)
+#### Phase 4: Der Durchbruch durch "Constrained Optimization"
 
-3. **Optionale Quanten-Veredelung**
+Selbst mit sanften Strafen war das Problem für die KI noch zu komplex. Der entscheidende Durchbruch kam durch eine Vereinfachung der Aufgabe:
+1.  **Daten filtern:** Das Modell wurde ausschließlich auf **stabilen Materialien** trainiert.
+2.  **Ziel fokussieren:** Das Modell lernte, **nur die Bandlücke vorherzusagen**.
+3.  **Score anpassen:** Die Bewertungsfunktion wurde so umgebaut, dass sie die vorhergesagte Bandlücke mit den "Genen" des Kandidaten (wie `formation_energy_per_atom`) kombiniert.
 
-   * VQE-Bewertung der besten Eliten
-   * Mischung aus Surrogat-Score + VQE-Score
+#### Finale Testergebnisse
 
-4. **Finalisierung**
+Mit dieser finalen Architektur zeigt das System das gewünschte Verhalten einer echten Optimierung. Der Diagnostik-Tab zeigt einen **Fitness-Verlauf**, bei dem der Score niedrig beginnt und sich über die Generationen hinweg einem Optimum annähert. Dies beweist, dass der Algorithmus aktiv den Suchraum erkundet und lernt.
 
-   * Export der besten Formeln und Diagnose-Daten (`gen_history.csv`, `surrogate_health.csv`)
 
----
+> *Finale Testergebnisse: Der "Fitness-Verlauf" zeigt, wie der beste Score (blaue Linie) über die Generationen ansteigt – ein klares Zeichen für eine erfolgreiche Optimierung.*
 
-### 🔹 Streamlit-Interface (`forge_studio_ui.py`)
+## Glossar
 
-Bietet Tabs für:
+*   **API-Key:** Ein geheimer Schlüssel zur Authentifizierung bei einem Web-Dienst wie dem Materials Project.
+*   **Bandlücke (Band Gap):** In der Festkörperphysik die Energie, die benötigt wird, um ein Elektron in einen leitenden Zustand anzuregen. Materialien mit einer Bandlücke sind Halbleiter oder Isolatoren.
+*   **DLL (Dynamic Link Library):** Eine unter Windows kompilierte Bibliothek mit C-Funktionen, die von anderen Programmen (hier: Python) aufgerufen werden kann.
+*   **Energie über der Hull (Energy Above Hull):** Ein Maß für die thermodynamische Stabilität eines Materials. Ein Wert von 0 eV/Atom bedeutet, dass das Material stabil ist. Positive Werte deuten auf Instabilität hin.
+*   **Evolutionärer Algorithmus:** Eine Optimierungstechnik, die von der biologischen Evolution inspiriert ist (Selektion, Kreuzung, Mutation).
+*   **Feature:** Eine einzelne messbare Eigenschaft oder ein Merkmal, das als Eingabe für ein Machine-Learning-Modell dient (z.B. `density`).
+*   **Kernel (OpenCL):** Ein kleines, in C geschriebenes Programm, das zur Ausführung auf den vielen Recheneinheiten einer GPU konzipiert ist.
+*   **MPG (Mycelial Prototype Graph):** Der Name des in diesem Projekt verwendeten Surrogatmodells.
+*   **OpenCL (Open Computing Language):** Ein offener Standard zur Programmierung von heterogenen Systemen, insbesondere zur Ausführung von Code auf GPUs.
+*   **Pheromon:** Im Kontext dieses Projekts eine Metapher für eine "Erinnerungsspur", die der Algorithmus in vielversprechenden Bereichen des Suchraums hinterlässt.
+*   **Prototyp:** Ein repräsentativer Datenpunkt, der einen Cluster oder eine "Region" im Datenraum repräsentiert. Das MPG-Modell nutzt eine Reihe von Prototypen, um sein "Wissen" zu strukturieren.
+*   **Streamlit:** Ein Python-Framework zur schnellen Erstellung von interaktiven Web-Anwendungen für Data-Science-Projekte.
+*   **Surrogatmodell:** Ein Machine-Learning-Modell, das als schneller "Ersatz" (Surrogat) für eine langsame oder teure Funktion (z.B. eine physikalische Simulation) dient.
 
-| Tab                  | Beschreibung                                                  |
-| -------------------- | ------------------------------------------------------------- |
-| **A)** Materialziele | Auswahl von Eigenschaften (Bandlücke, Energie …) & Gewichten  |
-| **B)** Synthese      | Start der Evolution mit Myzel- und VQE-Parametern             |
-| **C)** Diagnostik    | Visualisierung der Metriken & Gesundheits-Check der Surrogate |
+## Mitwirken
 
----
+Beiträge sind willkommen! Bitte öffnen Sie ein Issue, um Fehler zu melden oder neue Features vorzuschlagen.
 
-## 📊 Beispiel-Experiment
+## Lizenz
 
-**Parameter:**
-
-| Einstellung  | Wert                                                    |
-| ------------ | ------------------------------------------------------- |
-| Population   | 128                                                     |
-| Generationen | 100                                                     |
-| Ziele        | `bandgap (+1)`, `formation_energy (-1)`, `density (+1)` |
-| Myzel        | Guidance 0.45 · Decay 0.07 · Diffusion 0.04             |
-| VQE          | Gewicht 0.35 · 8 Eliten · 10 Qubits · 2 Layer           |
-
-**Ergebnis:**
-
-| Metrik        | Wert               |
-| ------------- | ------------------ |
-| GPU-Laufzeit  | **55,8 Sekunden**  |
-| CPU-Schätzung | 2,5 – 5 Stunden    |
-| Speed-Up      | Faktor ≈ 160 – 320 |
-| Beste Formel  | `F4Au4Ir10Pt8Ta5`  |
-
----
-
-## 📈 Leistungsanalyse
-
-* GPU: massiv parallele OpenCL-Ausführung
-* CPU: serielle oder geringe Parallelität
-* VQE-Simulationen × 200 Beschleunigung
-* Myzel- & Surrogat-Berechnung × 40 Beschleunigung
-
-➡️ Das System verwandelt eine mehrstündige Batch-Simulation in eine **interaktive Echtzeit-Erkundung**.
-
----
-
-## 🧪 Diagnose-Dateien
-
-| Datei                  | Inhalt                                                    |   |   |   |            |
-| ---------------------- | --------------------------------------------------------- | - | - | - | ---------- |
-| `gen_history.csv`      | Fitness pro Generation (best, mean, pheromone, VQE-calls) |   |   |   |            |
-| `surrogate_health.csv` | Modellqualität (NaN-Rate,                                 |   | W |   | ₂, Bias b) |
-| `*_export.csv`         | Liste der besten Material-Kandidaten mit Scores           |   |   |   |            |
-
----
-
-## 🧭 Empfehlungen & Best Practices
-
-* **Gewichte mit Bedacht wählen:**
-  z. B. `formation_energy = -1.0` → minimieren
-* **Diagnostik prüfen:** hohe `nan_rate` ⇒ Ziel unzuverlässig
-* **VQE-Gewichtung (γ)** moderat halten → Stabilität
-* **Seeds / Parameter sichern** für Reproduzierbarkeit
-* **GPU-Settings dokumentieren** (OpenCL-Plattform, Device-Index)
-
----
-
-## 🎓 Fazit
-
-Der **CipherCore-Treiber** verwandelt eine handelsübliche GPU in ein Labor für Materialforschung.
-Durch die Verbindung von **biologisch inspirierten Lernmechanismen (Myzel)** und **quantuminspirierter Veredelung (VQE)** entsteht ein neues Paradigma der computergestützten Entdeckung.
-
-> 💡 *„Forge Studio – wo Materialien auf der GPU wachsen.“*
-
----
-
-## 📜 Zitatempfehlung (APA Style)
-
-Krümmel, R. (2025). *Forge Studio – Myzel-Quanten-Evolution mit GPU-Beschleunigung* [Open-Source Software]. GitHub: [https://github.com/kruemmel-python/Forge-Studio](https://github.com/kruemmel-python/ElementForge)
-
----
-
+Dieses Projekt ist unter der MIT-Lizenz lizenziert. Weitere Informationen finden Sie in der `LICENSE`-Datei.

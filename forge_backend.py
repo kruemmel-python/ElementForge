@@ -1,45 +1,70 @@
-#!/usr/bin/env python3
+#!/usr-bin/env python3
 # -*- coding: utf-8 -*-
 """
-forge_backend.py
-================
-Vereinheitlichtes Backend für "Forge Studio" mit *echter* Myzel-Integration
-und optionaler VQE-Einbindung in die Fitness während der Evolution.
-
-Blöcke:
-A) Elemente bewerten (klassisch + Quantum/VQE)
-B) Material-Synthese (Evolution + Surrogat)
-C) Myzel-Variante (CipherCore-Myzelnetz mit Pheromon-Guidance)
-D) Optional: VQE direkt in der Fitness (Top-Eliten, GPU, Caching)
-
-Python 3.12: match/case (PEP 634–636), | (PEP 604), präzisere Fehler (PEP 626).
+forge_backend.py (Version 5.1 - Constrained Optimization)
+=========================================================
+- Implementiert einen vollständigen K-Means-Algorithmus auf der GPU unter
+  Verwendung der nativen Treiberfunktionen (Assignment, Segmented Sum, Update Step).
+- Nutzt Batched Matrix Multiplication für eine speichereffiziente und schnelle
+  Berechnung der Cross-Similarity im MPG-Modell.
+- Führt eine "Constrained Optimization" durch: Das Modell wird nur auf stabile
+  Materialien trainiert und optimiert primär die Bandlücke.
 """
-
 from __future__ import annotations
 
 import ctypes as C
-import re
-import sys
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
-from mendeleev import element as m_element
-from mendeleev import get_all_elements
+import sys
+from pathlib import Path
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from materials_mp_connector import MaterialsProjectConnector, ColumnMap
 
-# ------------------------------------------------------------
-# DLL / CTYPES
-# ------------------------------------------------------------
+def autodetect_dll() -> str:
+    """
+    Versucht, die kompilierte Treiberbibliothek an gängigen Orten zu finden.
+    Gibt den Pfad als String oder einen Standardnamen zurück, falls sie nicht gefunden wird.
+    """
+    if sys.platform == "win32":
+        lib_name = "CipherCore_OpenCl.dll"
+    elif sys.platform == "linux":
+        lib_name = "libopencl_driver.so"
+    elif sys.platform == "darwin":
+        lib_name = "libopencl_driver.dylib"
+    else:
+        return "CipherCore_OpenCl.dll"
 
-class PauliZTerm(C.Structure):
-    _fields_ = [("z_mask", C.c_uint64), ("coefficient", C.c_float)]
+    search_paths = [
+        Path.cwd(),
+        Path(__file__).parent,
+        Path.cwd() / "build",
+        Path.cwd() / "Release",
+        Path.cwd() / "Debug",
+    ]
 
+    for path in search_paths:
+        candidate = path / lib_name
+        if candidate.exists() and candidate.is_file():
+            print(f"[Info] Treiber-DLL automatisch erkannt: {candidate}")
+            return str(candidate)
+    
+    print(f"[Warnung] Konnte '{lib_name}' nicht automatisch erkennen. Bitte Pfad manuell angeben.")
+    return lib_name
+
+os.environ.setdefault("LOKY_MAX_CPU_COUNT", "4")
+
+# ============================================================================
+# ===  SCHICHT 1: CIPHERCORE TREIBER-WRAPPER (ERWEITERT)                    ===
+# ============================================================================
 
 class CipherCore:
-    """Wrapper um die CipherCore DLL inklusive Myzel- und VQE-Funktionen."""
     def __init__(self, dll_path: str | Path, gpu_index: int = 0) -> None:
         self.gpu_index = int(gpu_index)
         self.path = str(dll_path)
@@ -48,1078 +73,382 @@ class CipherCore:
         except OSError as e:
             raise OSError(f"Konnte DLL nicht laden: {self.path}") from e
 
-        # Basis
         self._def("initialize_gpu", [C.c_int], C.c_int, required=True)
         self._def("shutdown_gpu", [C.c_int], None)
-        self._def("allocate_gpu_memory", [C.c_int, C.c_size_t], C.c_void_p)
+        self._def("allocate_gpu_memory", [C.c_int, C.c_size_t], C.c_void_p, required=True)
         self._def("free_gpu_memory", [C.c_int, C.c_void_p], None)
-        self._def("write_host_to_gpu_blocking",
-                  [C.c_int, C.c_void_p, C.c_size_t, C.c_size_t, C.c_void_p], C.c_int)
-        self._def("read_gpu_to_host_blocking",
-                  [C.c_int, C.c_void_p, C.c_size_t, C.c_size_t, C.c_void_p], C.c_int)
+        self._def("write_host_to_gpu_blocking", [C.c_int, C.c_void_p, C.c_size_t, C.c_size_t, C.c_void_p], C.c_int, required=True)
+        self._def("read_gpu_to_host_blocking", [C.c_int, C.c_void_p, C.c_size_t, C.c_size_t, C.c_void_p], C.c_int, required=True)
+        self._def("finish_gpu", [C.c_int], C.c_int)
 
-        # Kernels
-        self.has_matmul = self._def("execute_matmul_on_gpu",
-                                    [C.c_int, C.c_void_p, C.c_void_p, C.c_void_p,
-                                     C.c_int, C.c_int, C.c_int, C.c_int], C.c_int)
-        self.has_similarity = self._def("execute_pairwise_similarity_gpu",
-                                        [C.c_int, C.c_void_p, C.c_void_p, C.c_int, C.c_int], C.c_int)
-        # VQE
-        self.has_vqe = self._def(
-            "execute_vqe_gpu",
-            [C.c_int, C.c_int, C.c_int,
-             np.ctypeslib.ndpointer(dtype=np.float32, flags="C_CONTIGUOUS"), C.c_int,
-             C.POINTER(PauliZTerm), C.c_int, C.POINTER(C.c_float), C.c_void_p],
-            C.c_int
-        )
-        # Myzel
+        self.has_matmul = self._def("execute_matmul_batched_on_gpu", [C.c_int, C.c_void_p, C.c_void_p, C.c_void_p, C.c_int, C.c_int, C.c_int, C.c_int], C.c_int)
+        self.has_pairwise = self._def("execute_pairwise_similarity_gpu", [C.c_int, C.c_void_p, C.c_void_p, C.c_int, C.c_int], C.c_int)
+        self.has_assign = self._def("execute_dynamic_token_assignment_gpu", [C.c_int, C.c_void_p, C.c_void_p, C.c_void_p, C.c_int, C.c_int, C.c_int, C.c_int], C.c_int)
+        self.has_segsum = self._def("execute_proto_segmented_sum_gpu", [C.c_int, C.c_void_p, C.c_void_p, C.c_void_p, C.c_void_p, C.c_int, C.c_int, C.c_int], C.c_int)
+        self.has_proupd = self._def("execute_proto_update_step_gpu", [C.c_int, C.c_void_p, C.c_void_p, C.c_void_p, C.c_float, C.c_int, C.c_int], C.c_int)
+        
         self.has_mycel = self._def("subqg_init_mycel", [C.c_int, C.c_int, C.c_int, C.c_int], C.c_int)
         if self.has_mycel:
-            self._def("set_neighbors_sparse",
-                      [C.c_int, np.ctypeslib.ndpointer(dtype=np.int32, flags="C_CONTIGUOUS")], C.c_int)
-            self._def("step_pheromone_reinforce",
-                      [C.c_int, np.ctypeslib.ndpointer(dtype=np.float32, flags="C_CONTIGUOUS")], C.c_int)
+            self._def("subqg_set_active_T", [C.c_int, C.c_int], C.c_int)
+            self._def("set_neighbors_sparse", [C.c_int, np.ctypeslib.ndpointer(dtype=np.int32, flags="C_CONTIGUOUS")], C.c_int)
+            self._def("step_pheromone_reinforce", [C.c_int, np.ctypeslib.ndpointer(dtype=np.float32, flags="C_CONTIGUOUS")], C.c_int)
             self._def("step_pheromone_diffuse_decay", [C.c_int], C.c_int)
-            self._def("read_pheromone_slice",
-                      [C.c_int, C.c_int, np.ctypeslib.ndpointer(dtype=np.float32, flags="C_CONTIGUOUS")], C.c_int)
-            self._def("set_pheromone_gains",
-                      [C.c_int, np.ctypeslib.ndpointer(dtype=np.float32, flags="C_CONTIGUOUS"), C.c_int], C.c_int)
+            self._def("read_pheromone_slice", [C.c_int, C.c_int, np.ctypeslib.ndpointer(dtype=np.float32, flags="C_CONTIGUOUS")], C.c_int)
+            self._def("set_pheromone_gains", [C.c_int, np.ctypeslib.ndpointer(dtype=np.float32, flags="C_CONTIGUOUS"), C.c_int], C.c_int)
             self._def("set_diffusion_params", [C.c_int, C.c_float, C.c_float], C.c_int)
 
-        # Init
-        ok = self.lib.initialize_gpu(self.gpu_index)
-        if not ok:
-            raise RuntimeError(f"initialize_gpu({self.gpu_index}) fehlgeschlagen: {self.path}")
+        if not self.lib.initialize_gpu(self.gpu_index):
+            raise RuntimeError(f"GPU-Init fehlgeschlagen: {dll_path}")
 
     def _def(self, name: str, argtypes: list, restype, required: bool = False) -> bool:
         if hasattr(self.lib, name):
-            fn = getattr(self.lib, name)
-            fn.argtypes = argtypes
-            fn.restype = restype
+            fn = getattr(self.lib, name); fn.argtypes, fn.restype = argtypes, restype
             return True
-        if required:
-            raise AttributeError(f"Fehlende DLL-Funktion: {name}")
+        if required: raise AttributeError(f"Fehlende DLL-Funktion: {name}")
         return False
+    def malloc(self, nb: int) -> C.c_void_p:
+        p = self.lib.allocate_gpu_memory(self.gpu_index, nb)
+        if not p: raise MemoryError(f"GPU-Malloc fehlgeschlagen ({nb} bytes)")
+        return p
+    def free(self, p: C.c_void_p | None):
+        if p: self.lib.free_gpu_memory(self.gpu_index, p)
+    def h2d(self, a: np.ndarray, p: C.c_void_p | None = None) -> C.c_void_p:
+        ac = np.ascontiguousarray(a, dtype=np.float32); p = p or self.malloc(ac.nbytes)
+        if not self.lib.write_host_to_gpu_blocking(self.gpu_index, p, 0, ac.nbytes, ac.ctypes.data_as(C.c_void_p)):
+            raise RuntimeError("H2D-Transfer fehlgeschlagen.")
+        return p
+    def d2h(self, p: C.c_void_p, sh: np.ndarray) -> np.ndarray:
+        o = np.empty_like(sh, dtype=np.float32)
+        if not self.lib.read_gpu_to_host_blocking(self.gpu_index, p, 0, o.nbytes, o.ctypes.data_as(C.c_void_p)):
+            raise RuntimeError("D2H-Transfer fehlgeschlagen.")
+        return o
 
-    # --- Memory/IO ---
-    def malloc(self, nbytes: int) -> C.c_void_p:
-        ptr = self.lib.allocate_gpu_memory(self.gpu_index, nbytes)
-        if not ptr:
-            raise MemoryError(f"GPU-Allocate fehlgeschlagen (bytes={nbytes})")
-        return ptr
-
-    def free(self, ptr: C.c_void_p) -> None:
-        self.lib.free_gpu_memory(self.gpu_index, ptr)
-
-    def h2d(self, dst: C.c_void_p, arr: np.ndarray) -> None:
-        if arr.nbytes == 0:
-            return
-        ok = self.lib.write_host_to_gpu_blocking(self.gpu_index, dst, 0, arr.nbytes,
-                                                 arr.ctypes.data_as(C.c_void_p))
-        if not ok:
-            raise RuntimeError("Host->GPU Transfer fehlgeschlagen.")
-
-    def d2h(self, src: C.c_void_p, arr: np.ndarray) -> None:
-        if arr.nbytes == 0:
-            return
-        ok = self.lib.read_gpu_to_host_blocking(self.gpu_index, src, 0, arr.nbytes,
-                                                arr.ctypes.data_as(C.c_void_p))
-        if not ok:
-            raise RuntimeError("GPU->Host Transfer fehlgeschlagen.")
-
-    # --- High-Level ---
     def pairwise_similarity(self, X: np.ndarray) -> np.ndarray:
-        X = X.astype(np.float32, copy=False)
-        if not self.has_similarity:
-            return X @ X.T
         N, D = X.shape
-        S = np.empty((N, N), dtype=np.float32)
-        dX, dS = self.malloc(X.nbytes), self.malloc(S.nbytes)
+        if not self.has_pairwise: return (X @ X.T).astype(np.float32, copy=False)
+        dX, dS = self.h2d(X), self.malloc(N * N * 4)
         try:
-            self.h2d(dX, X)
-            ok = self.lib.execute_pairwise_similarity_gpu(self.gpu_index, dX, dS, N, D)
-            if not ok:
-                raise RuntimeError("execute_pairwise_similarity_gpu fehlgeschlagen.")
-            self.d2h(dS, S)
-        finally:
-            self.free(dX); self.free(dS)
-        return S
+            if not self.lib.execute_pairwise_similarity_gpu(self.gpu_index, dX, dS, N, D): raise RuntimeError("pairwise_similarity fehlgeschlagen.")
+            return self.d2h(dS, np.empty((N, N), dtype=np.float32))
+        finally: self.free(dX); self.free(dS)
 
-    def matmul(self, A: np.ndarray, B: np.ndarray) -> np.ndarray:
-        A = A.astype(np.float32, copy=False)
-        B = B.astype(np.float32, copy=False)
-        if not self.has_matmul:
-            return A @ B
-        M, K = A.shape; K2, N = B.shape
-        if K2 != K:
-            raise ValueError("Matmul: inkompatible Shapes.")
-        C_ = np.empty((M, N), dtype=np.float32)
-        dA, dB, dC = self.malloc(A.nbytes), self.malloc(B.nbytes), self.malloc(C_.nbytes)
+    def cross_similarity_batched(self, A: np.ndarray, B: np.ndarray, rows_per_batch: int = 1024) -> np.ndarray:
+        A, B = np.ascontiguousarray(A, dtype=np.float32), np.ascontiguousarray(B, dtype=np.float32)
+        N, D = A.shape; T, D2 = B.shape
+        if D != D2: raise ValueError("D-Mismatch")
+        if not self.has_matmul or N <= rows_per_batch: return (A @ B.T).astype(np.float32, copy=False)
+
+        nb = (N + rows_per_batch - 1) // rows_per_batch; M = rows_per_batch
+        A_pad = np.zeros((nb * M, D), dtype=np.float32); A_pad[:N, :] = A
+        A_batched = A_pad.reshape(nb, M, D)
+        B_batched_T = np.broadcast_to(B.T, (nb, D, T)).copy()
+
+        dA, dB = self.h2d(A_batched), self.h2d(B_batched_T)
+        dC = self.malloc(nb * M * T * 4)
         try:
-            self.h2d(dA, A); self.h2d(dB, B)
-            ok = self.lib.execute_matmul_on_gpu(self.gpu_index, dA, dB, dC, 1, M, N, K)
-            if not ok:
-                raise RuntimeError("execute_matmul_on_gpu fehlgeschlagen.")
-            self.d2h(dC, C_)
-        finally:
-            self.free(dA); self.free(dB); self.free(dC)
-        return C_
+            if not self.lib.execute_matmul_batched_on_gpu(self.gpu_index, dA, dB, dC, nb, M, T, D): raise RuntimeError("batched matmul fehlgeschlagen.")
+            return self.d2h(dC, np.empty((nb, M, T), dtype=np.float32)).reshape(nb * M, T)[:N, :]
+        finally: self.free(dA); self.free(dB); self.free(dC)
 
-    def vqe_energy(self, num_qubits: int, layers: int, params: np.ndarray, terms: list[PauliZTerm]) -> float:
-        if not self.has_vqe:
-            raise NotImplementedError("VQE nicht verfügbar.")
-        params = np.ascontiguousarray(params.astype(np.float32))
-        out_e = C.c_float(0.0)
-        TermArray = PauliZTerm * len(terms)
-        h_array = TermArray(*terms)
-        ok = self.lib.execute_vqe_gpu(self.gpu_index, int(num_qubits), int(layers),
-                                      params, int(params.size), h_array, int(len(terms)),
-                                      C.byref(out_e), None)
-        if not ok:
-            raise RuntimeError("execute_vqe_gpu fehlgeschlagen.")
-        return float(out_e.value)
+    def assign_to_prototypes(self, X_gpu, P_gpu, N, T, D) -> C.c_void_p:
+        d_assign = self.malloc(N * 4)
+        if not self.lib.execute_dynamic_token_assignment_gpu(self.gpu_index, X_gpu, P_gpu, d_assign, 1, N, D, T):
+            raise RuntimeError("execute_dynamic_token_assignment_gpu fehlgeschlagen.")
+        return d_assign
 
-    # --- Myzel: Helfer ---
-    def mycel_init(self, nodes: int, k_neighbors: int, layers: int = 1) -> None:
-        if not self.has_mycel:
-            raise NotImplementedError("Myzel-Funktionalität fehlt in der DLL.")
-        ok = self.lib.subqg_init_mycel(self.gpu_index, int(nodes), int(k_neighbors), int(layers))
-        if not ok:
-            raise RuntimeError("subqg_init_mycel fehlgeschlagen.")
-
-    def mycel_set_neighbors(self, neigh_idx: np.ndarray) -> None:
-        neigh_idx = np.ascontiguousarray(neigh_idx.astype(np.int32))
-        ok = self.lib.set_neighbors_sparse(self.gpu_index, neigh_idx)
-        if not ok:
-            raise RuntimeError("set_neighbors_sparse fehlgeschlagen.")
-
-    def mycel_set_params(self, diffusion: float, decay: float, gains: np.ndarray | None = None) -> None:
-        ok = self.lib.set_diffusion_params(self.gpu_index, C.c_float(diffusion), C.c_float(decay))
-        if not ok:
-            raise RuntimeError("set_diffusion_params fehlgeschlagen.")
-        if gains is not None:
-            gains = np.ascontiguousarray(gains.astype(np.float32))
-            ok2 = self.lib.set_pheromone_gains(self.gpu_index, gains, int(gains.size))
-            if not ok2:
-                raise RuntimeError("set_pheromone_gains fehlgeschlagen.")
-
-    def mycel_reinforce(self, delta: np.ndarray) -> None:
-        delta = np.ascontiguousarray(delta.astype(np.float32))
-        ok = self.lib.step_pheromone_reinforce(self.gpu_index, delta)
-        if not ok:
-            raise RuntimeError("step_pheromone_reinforce fehlgeschlagen.")
-
-    def mycel_diffuse_decay(self) -> None:
-        ok = self.lib.step_pheromone_diffuse_decay(self.gpu_index)
-        if not ok:
-            raise RuntimeError("step_pheromone_diffuse_decay fehlgeschlagen.")
-
-    def mycel_read(self, layer: int, out_buf: np.ndarray) -> np.ndarray:
-        out = np.ascontiguousarray(out_buf.astype(np.float32))
-        ok = self.lib.read_pheromone_slice(self.gpu_index, int(layer), out)
-        if not ok:
-            raise RuntimeError("read_pheromone_slice fehlgeschlagen.")
-        return out
-
-    def __del__(self) -> None:
+    def kmeans_update_step_gpu(self, P_gpu, X_gpu, assign_gpu, N, T, D, lr):
+        d_sums, d_counts = self.malloc(T * D * 4), self.malloc(T * 4)
         try:
-            self.lib.shutdown_gpu(self.gpu_index)
-        except Exception:
-            pass
-
-
-# ------------------------------------------------------------
-# Utilities
-# ------------------------------------------------------------
-
-def normalize01(x: np.ndarray | pd.Series) -> np.ndarray:
-    arr = np.asarray(x, dtype=np.float32)
-    finite = arr[np.isfinite(arr)]
-    if finite.size == 0:
-        return np.full_like(arr, 0.5, dtype=np.float32)
-    lo, hi = float(np.min(finite)), float(np.max(finite))
-    span = hi - lo
-    if span < 1e-9:
-        return np.full_like(arr, 0.5, dtype=np.float32)
-    out = (arr - lo) / span
-    out[~np.isfinite(arr)] = 0.5
-    return np.clip(out, 0.0, 1.0).astype(np.float32)
-
-
-def autodetect_dll() -> str:
-    for ext in ("dll", "so", "dylib"):
-        for name in (f"CipherCore_OpenCl.{ext}", f"libCipherCore_OpenCl.{ext}", f"libCC_OpenCl.{ext}"):
-            p = Path(f"./{name}")
-            if p.exists() and p.is_file():
-                return str(p)
-    return "./CipherCore_OpenCl.dll"
-
+            if not self.lib.execute_proto_segmented_sum_gpu(self.gpu_index, X_gpu, assign_gpu, d_sums, d_counts, N, D, T):
+                raise RuntimeError("execute_proto_segmented_sum_gpu fehlgeschlagen.")
+            if not self.lib.execute_proto_update_step_gpu(self.gpu_index, P_gpu, d_sums, d_counts, C.c_float(lr), D, T):
+                raise RuntimeError("execute_proto_update_step_gpu fehlgeschlagen.")
+        finally: self.free(d_sums); self.free(d_counts)
+    
+    def mycel_init(self, n, k):
+        if not self.lib.subqg_init_mycel(self.gpu_index,n,1,k): raise RuntimeError("subqg_init_mycel fehlgeschlagen.")
+    def mycel_set_active_T(self, t):
+        if not self.lib.subqg_set_active_T(self.gpu_index,t): raise RuntimeError("subqg_set_active_T fehlgeschlagen.")
+    def mycel_set_neighbors(self, nidx):
+        if not self.lib.set_neighbors_sparse(self.gpu_index,np.ascontiguousarray(nidx,dtype=np.int32)): raise RuntimeError("set_neighbors_sparse fehlgeschlagen.")
+    def mycel_set_params(self, diff, dec, gains):
+        if not self.lib.set_diffusion_params(self.gpu_index,C.c_float(diff),C.c_float(dec)): raise RuntimeError("set_diffusion_params fehlgeschlagen.")
+        if not self.lib.set_pheromone_gains(self.gpu_index,np.ascontiguousarray(gains,dtype=np.float32),gains.size): raise RuntimeError("set_pheromone_gains fehlgeschlagen.")
+    def mycel_reinforce(self, d):
+        if not self.lib.step_pheromone_reinforce(self.gpu_index,np.ascontiguousarray(d,dtype=np.float32)): raise RuntimeError("step_pheromone_reinforce fehlgeschlagen.")
+    def mycel_diffuse_decay(self):
+        if not self.lib.step_pheromone_diffuse_decay(self.gpu_index): raise RuntimeError("step_pheromone_diffuse_decay fehlgeschlagen.")
+    def mycel_read(self, buf):
+        if not self.lib.read_pheromone_slice(self.gpu_index,0,np.ascontiguousarray(buf,dtype=np.float32)): raise RuntimeError("read_pheromone_slice fehlgeschlagen.")
+        return buf
+        
+    def __del__(self):
+        if hasattr(self, 'lib') and self.lib: self.lib.shutdown_gpu(self.gpu_index)
 
 # ============================================================================
-# A) Elemente bewerten
+# ===  DATENLADEN & GPU-KMEANS                                            ===
 # ============================================================================
+def load_dataframe(source_type, path_or_query, api_key=None, column_map=None):
+    if source_type == "Lokale CSV":
+        if hasattr(path_or_query, "read"): return pd.read_csv(path_or_query)
+        if not Path(str(path_or_query)).exists(): raise FileNotFoundError(f"CSV nicht gefunden: {path_or_query}")
+        df = pd.read_csv(path_or_query)
+        if df.shape[0] < 2: raise ValueError("Trainingsdaten leer oder enthalten nur einen Punkt.")
+        return df
+    elif source_type == "Materials Project":
+        if not isinstance(path_or_query, dict) or column_map is None: raise ValueError("Für MP wird 'query' und 'column_map' benötigt.")
+        df = MaterialsProjectConnector(column_map, api_key, path_or_query).fetch()
+        if df.shape[0] < 2: raise ValueError("Materials Project lieferte <2 Zeilen.")
+        return df
+    raise ValueError(f"Unbekannter Quelltyp: {source_type}")
 
-SUPPORTED_ELEMENT_FEATURES = [
-    "density", "melting_point", "boiling_point", "atomic_weight",
-    "electronegativity_pauling", "vdw_radius", "covalent_radius", "ionization_energy",
-]
-
-def _safe_ion_energy(el) -> float | None:
+def gpu_kmeans_full(cc: CipherCore, Xs_gpu: C.c_void_p, N: int, D: int, T: int, iters: int = 8, lr: float = 1.0, seed: int = 42) -> np.ndarray:
+    print(f"  - Starte GPU-KMeans: {N} Samples -> {T} Prototypen...")
+    rng = np.random.default_rng(seed)
+    initial_indices = rng.choice(N, size=T, replace=False)
+    X_host = cc.d2h(Xs_gpu, np.empty((N, D), dtype=np.float32))
+    prototypes_host = X_host[initial_indices].copy()
+    P_gpu = cc.h2d(prototypes_host)
+    
+    assign_gpu = None
     try:
-        d = getattr(el, "ionenergies", None) or getattr(el, "ionization_energies", None)
-        return d.get(1) if isinstance(d, dict) else None
-    except Exception:
-        return None
-
-def load_element_df() -> pd.DataFrame:
-    rec = []
-    for el in get_all_elements():
-        rec.append({
-            "atomic_number": el.atomic_number,
-            "symbol": el.symbol,
-            "name": el.name,
-            "atomic_weight": el.atomic_weight,
-            "density": el.density,
-            "melting_point": el.melting_point,
-            "boiling_point": el.boiling_point,
-            "electronegativity_pauling": el.electronegativity("pauling"),
-            "vdw_radius": el.vdw_radius,
-            "covalent_radius": getattr(el, "covalent_radius_pyykko", None),
-            "ionization_energy": _safe_ion_energy(el),
-        })
-    return pd.DataFrame(rec)
-
-def _objective_score(df_feat: pd.DataFrame, objectives: dict[str, float]) -> pd.Series:
-    s = np.zeros(len(df_feat), dtype=np.float32)
-    for col, w in objectives.items():
-        ncol = f"norm_{col}"
-        if ncol not in df_feat:
-            continue
-        v = df_feat[ncol].to_numpy(np.float32)
-        s += (1.0 - v) * abs(float(w)) if w < 0 else v * float(w)
-    return pd.Series(normalize01(s), index=df_feat.index, name="objective_score")
-
-def _ising_terms_from_objectives(props_norm: dict[str, float], objectives: dict[str, float], num_qubits: int) -> list[PauliZTerm]:
-    terms: list[PauliZTerm] = []
-    q = 0
-    for k, w in objectives.items():
-        if k not in props_norm:
-            continue
-        coeff = -float(w) * (float(props_norm[k]) - 0.5) * 2.0
-        t = PauliZTerm()
-        t.z_mask = C.c_uint64(1 << (q % max(1, num_qubits)))
-        t.coefficient = C.c_float(coeff)
-        terms.append(t)
-        q += 1
-    return terms
-
-def _default_vqe_params(num_qubits: int, layers: int, seed: float = 0.5) -> np.ndarray:
-    n = layers * 2 * num_qubits
-    return np.sin(0.5 * np.arange(n, dtype=np.float32) + float(seed)).astype(np.float32)
-
-def score_elements(dll_path: str, gpu_index: int,
-                   mode: str, objectives: dict[str, float],
-                   *, uniqueness_weight: float = 0.3,
-                   quantum_weight: float = 0.5,
-                   num_qubits: int = 4, ansatz_layers: int = 2) -> pd.DataFrame:
-    df = load_element_df()
-    feats = [f for f in objectives if f in df.columns]
-    if not feats:
-        raise ValueError("Keine gültigen Feature-Namen in 'objectives'.")
-    df_feat = df[["symbol", "name"] + feats].copy()
-    for f in feats:
-        df_feat[f"norm_{f}"] = normalize01(df_feat[f])
-    df_feat["objective_score"] = _objective_score(df_feat, objectives)
-
-    if mode == "classic":
-        X = np.stack([df_feat[f"norm_{f}"].to_numpy(np.float32) for f in feats], axis=1).astype(np.float32)
-        try:
-            cc = CipherCore(dll_path, gpu_index)
-            S = cc.pairwise_similarity(X)
-        except Exception as e:
-            print(f"[WARNUNG] Fallback CPU-Similarity ({e})", file=sys.stderr)
-            S = X @ X.T
-        np.fill_diagonal(S, 0.0)
-        df_feat["uniqueness_score"] = normalize01(1.0 - np.max(S, axis=1))
-        α = float(np.clip(uniqueness_weight, 0.0, 1.0))
-        df_feat["final_score"] = normalize01(
-            (1.0 - α) * df_feat["objective_score"].to_numpy(np.float32)
-            + α * df_feat["uniqueness_score"].to_numpy(np.float32)
-        )
-        cols = ["symbol", "name", "final_score", "objective_score", "uniqueness_score"] + feats
-        return df_feat.sort_values("final_score", ascending=False).reset_index(drop=True)[cols]
-
-    elif mode == "quantum":
-        cc = CipherCore(dll_path, gpu_index)
-        if not cc.has_vqe:
-            raise NotImplementedError("DLL bietet keine VQE-Funktion.")
-        energies = []
-        for _, row in df_feat.iterrows():
-            props = {f: float(row[f"norm_{f}"]) for f in feats}
-            terms = _ising_terms_from_objectives(props, objectives, num_qubits)
-            if not terms:
-                energies.append(np.nan); continue
-            params = _default_vqe_params(num_qubits, ansatz_layers, seed=props.get("density", 0.5))
-            try:
-                e = cc.vqe_energy(num_qubits, ansatz_layers, params, terms)
-            except Exception as e0:
-                print(f"[VQE] {row['symbol']}: {e0}", file=sys.stderr)
-                e = np.nan
-            energies.append(e)
-        df_feat["vqe_energy"] = energies
-        df_feat["quantum_score"] = 1.0 - normalize01(df_feat["vqe_energy"].to_numpy(np.float32))
-        β = float(np.clip(quantum_weight, 0.0, 1.0))
-        df_feat["final_score"] = normalize01(
-            (1.0 - β) * df_feat["objective_score"].to_numpy(np.float32)
-            + β * df_feat["quantum_score"].to_numpy(np.float32)
-        )
-        cols = ["symbol", "name", "final_score", "objective_score", "quantum_score", "vqe_energy"] + feats
-        return df_feat.sort_values("final_score", ascending=False).reset_index(drop=True)[cols]
-    else:
-        raise ValueError(f"Unbekannter Modus: {mode!r}")
-
+        for i in range(iters):
+            assign_gpu = cc.assign_to_prototypes(Xs_gpu, P_gpu, N, T, D)
+            cc.kmeans_update_step_gpu(P_gpu, Xs_gpu, assign_gpu, N, T, D, lr=lr)
+            cc.free(assign_gpu); assign_gpu = None
+        return cc.d2h(P_gpu, np.empty((T, D), dtype=np.float32))
+    finally:
+        cc.free(P_gpu)
+        if assign_gpu: cc.free(assign_gpu)
 
 # ============================================================================
-# B) Material-Synthese (Basis)
+# ===  MPG MODELL & EVOLUTION                                             ===
 # ============================================================================
-
-JARVIS_DATASET_ALIASES: dict[str, str] = {
-    "jdft_3d": "dft_3d",
-    "jdft_2d": "dft_2d",
-    "dft_3d_2021": "dft_3d",
-    "dft_2d_2021": "dft_2d",
-    "cfid": "cfid_3d",
-}
-
-_TOKEN = re.compile(r"([A-Z][a-z]?)(\d*(?:\.\d+)?)")
-
-def load_jarvis_dataframe(dataset: str = "dft_3d") -> pd.DataFrame:
-    from jarvis.db.figshare import data as jarvis_data
-    key = JARVIS_DATASET_ALIASES.get(dataset, dataset)
-    raw = jarvis_data(dataset=key)
-    df = pd.DataFrame(raw)
-    if "formula" not in df.columns:
-        for alt in ("formula_pretty", "compound"):
-            if alt in df.columns:
-                df["formula"] = df[alt]; break
-        else:
-            raise ValueError("Keine Formelspalte in JARVIS-Daten gefunden.")
-    df = df.dropna(subset=["formula"]).reset_index(drop=True)
-    return df
-
-def parse_formula(formula: str) -> dict[str, float]:
-    counts: dict[str, float] = {}
-    for el, nstr in _TOKEN.findall(str(formula)):
-        n = float(nstr) if nstr else 1.0
-        counts[el] = counts.get(el, 0.0) + n
-    if not counts:
-        raise ValueError(f"Formel nicht parsebar: {formula!r}")
-    return counts
-
-def build_vocab(df: pd.DataFrame, max_elems: int = 32) -> list[str]:
-    from collections import Counter
-    cnt: Counter[str] = Counter()
-    for f in df["formula"].astype(str):
-        for el, n in parse_formula(f).items():
-            cnt[el] += n
-    vocab = [e for e, _ in cnt.most_common(max_elems)]
-    vocab.sort(key=lambda x: (len(x), x))
-    return vocab
-
-def fraction_features(formula: str, vocab: Sequence[str]) -> np.ndarray:
-    comp = parse_formula(formula)
-    s = sum(comp.values())
-    vec = np.zeros((len(vocab),), dtype=np.float32)
-    if s <= 0:
-        return vec
-    for i, el in enumerate(vocab):
-        if el in comp:
-            vec[i] = float(comp[el] / s)
-    return vec
-
-def _clean_target(y_raw: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Entfernt NaNs/Inf und gibt nur FINITE y zurück."""
-    y = np.asarray(y_raw, dtype=np.float64).reshape(-1)
-    mask = np.isfinite(y)
-    return y[mask], mask
-
-
 @dataclass(slots=True)
-class Surrogate:
-    mu: np.ndarray
-    sigma: np.ndarray
-    W: np.ndarray
-    b: float
+class MPGModel:
+    prototypes: np.ndarray; prototype_properties: np.ndarray; neighbor_indices: np.ndarray
+    scaler: StandardScaler
 
+# ============================================================================
+# ===  EVOLUTIONÄRE OPERATOREN                                            ===
+# ============================================================================
+def crossover_blend(p1: np.ndarray, p2: np.ndarray, alpha: float = 0.5) -> np.ndarray:
+    return alpha * p1 + (1.0 - alpha) * p2
 
-def train_surrogate_scalar(Xfrac: np.ndarray, y_raw: np.ndarray) -> Surrogate:
-    """Lineare Regression (QR), robust gegen NaNs in y."""
-    y_clean, mask = _clean_target(y_raw)
-    if y_clean.size < 2:
-        # fallback: sehr schwaches, nahezu neutrales Modell
-        D = Xfrac.shape[1]
-        mu = Xfrac.mean(axis=0, keepdims=True).astype(np.float32)
-        sigma = (Xfrac.std(axis=0, keepdims=True) + 1e-8).astype(np.float32)
-        return Surrogate(mu, sigma, np.zeros((D,), dtype=np.float32), 0.0)
+def mutate_gaussian(ind: np.ndarray, space: Dict[str, Tuple[float, float]], strength: float) -> np.ndarray:
+    mutated = ind.copy()
+    rng = np.random.default_rng()
+    for i, (key, (low, high)) in enumerate(space.items()):
+        scale = (high - low) * strength
+        mutated[i] += rng.normal(0, scale)
+    return mutated
 
-    X = Xfrac[mask].astype(np.float64, copy=False)
-    y = y_clean.reshape(-1, 1).astype(np.float64, copy=False)
+def _clip_to_space(ind: np.ndarray, space: Dict[str, Tuple[float, float]]) -> np.ndarray:
+    clipped = ind.copy()
+    i = 0
+    for key, (low, high) in space.items():
+        clipped[i] = np.clip(clipped[i], low, high)
+        i += 1
+    return clipped
 
-    mu = X.mean(axis=0, keepdims=True)
-    sigma = X.std(axis=0, keepdims=True) + 1e-8
-    Xn = (X - mu) / sigma
+def _apply_guidance(norm_ind: np.ndarray, pheromones: np.ndarray, strength: float) -> np.ndarray:
+    if not np.any(pheromones) or pheromones.sum() < 1e-9:
+        return norm_ind
+    
+    guidance_vec = pheromones / pheromones.sum()
+    guided = norm_ind * (1.0 - strength) + guidance_vec * strength
+    return np.clip(guided, 0, 1)
 
-    # QR-Lösung, kleinste Quadrate
-    X1 = np.c_[Xn, np.ones((Xn.shape[0], 1))]
-    Q, R = np.linalg.qr(X1)
-    beta = np.linalg.solve(R, Q.T @ y)  # (D+1, 1)
+def _adaptive_softmax_row(x: np.ndarray) -> np.ndarray:
+    std = float(np.std(x));
+    if std < 1e-9: return np.full(x.shape, 1.0/x.size, dtype=np.float32)
+    z = (x - float(np.mean(x))) / std; e = np.exp(z); return e / e.sum()
 
-    W = beta[:-1].astype(np.float32)
-    b = float(beta[-1, 0])
-    return Surrogate(mu.astype(np.float32), sigma.astype(np.float32), W, b)
+# NEUE, FINALE VERSION von train_mpg_surrogates
+def train_mpg_surrogates(cc: CipherCore, df: pd.DataFrame, search_space, obj_list, n_prototypes=64, k_neighbors=8, use_gpu_kmeans=True) -> Dict[str, MPGModel]:
+    # --- SCHRITT 1: Filtere die Trainingsdaten auf stabile Materialien ---
+    # Wir behalten nur Materialien, die sehr stabil sind (e_above_hull <= 0.02 eV/Atom)
+    # 0.02 ist eine kleine Toleranz für Berechnungsungenauigkeiten.
+    df_stable = df[df['e_above_hull'] <= 0.02].copy().reset_index(drop=True)
+    
+    print(f"[Info] Nach Stabilitätsfilter: {len(df_stable)} von {len(df)} Materialien verbleiben für das Training.")
+    if len(df_stable) < n_prototypes:
+        print(f"[Warnung] Nach Filterung sind zu wenige Datenpunkte ({len(df_stable)}) übrig. Reduziere Prototypen auf {len(df_stable)}.")
+        n_prototypes = max(2, len(df_stable))
 
-
-def safe_train_surrogate_map(df: pd.DataFrame, vocab: list[str], obj_list: list[str]) -> dict[str, Surrogate]:
-    """Baut alle Surrogate; droppt Ziele ohne verwertbare y (nur intern)."""
-    X0 = np.vstack([fraction_features(f, vocab) for f in df["formula"]]).astype(np.float32)
-    sur_map: dict[str, Surrogate] = {}
-    for obj in obj_list:
-        y_raw = pd.to_numeric(df[obj], errors="coerce").to_numpy(np.float32)
-        sur_map[obj] = train_surrogate_scalar(X0, y_raw)
-    return sur_map
-
-def gpu_matmul(cc: CipherCore, A: np.ndarray, B: np.ndarray) -> np.ndarray:
-    if cc.has_matmul:
-        return cc.matmul(A, B)
-    return A.astype(np.float32) @ B.astype(np.float32)
-
-def predict_scalar_gpu(cc: CipherCore, sur: Surrogate, Xfrac: np.ndarray) -> np.ndarray:
-    """Vorhersage y = Xn @ W + b, robust für GPU-Matmul (W als Spaltenvektor)."""
-    X = Xfrac.astype(np.float32, copy=False)
-    Xn = (X - sur.mu) / sur.sigma
-    W = sur.W.reshape(-1, 1).astype(np.float32)  # <— Spaltenvektor
-    if cc.has_matmul:
-        y = cc.matmul(Xn, W)                      # (N, 1)
-        y = y.reshape(-1)
-    else:
-        y = (Xn @ W).reshape(-1)
-    return (y + sur.b).astype(np.float32)
-
-
-def _renorm_nonneg(v: np.ndarray) -> np.ndarray:
-    v = np.clip(v, 0.0, 1.0)
-    s = float(v.sum())
-    if s <= 0.0:
-        j = int(np.argmax(v))
-        out = np.zeros_like(v, dtype=np.float32); out[j] = 1.0
-        return out
-    return (v / s).astype(np.float32)
-
-def mutate_vec(v: np.ndarray, *, sigma: float = 0.05, strategy: str = "gaussian") -> np.ndarray:
-    v = v.astype(np.float32, copy=True)
-    match strategy:
-        case "gaussian":
-            v += np.random.normal(0.0, sigma, size=v.shape).astype(np.float32)
-        case "cauchy":
-            v += (np.random.standard_cauchy(size=v.shape).astype(np.float32) * (sigma * 0.2))
-        case "dirichlet":
-            alpha = np.full(v.size, 1.5, dtype=np.float64)
-            v = np.random.dirichlet(alpha).astype(np.float32)
-        case _:
-            v += np.random.normal(0.0, sigma, size=v.shape).astype(np.float32)
-    return _renorm_nonneg(v)
-
-def crossover_sbx(a: np.ndarray, b: np.ndarray, n: float = 2.0) -> np.ndarray:
-    a = a.astype(np.float32, copy=False); b = b.astype(np.float32, copy=False)
-    u = np.random.rand(*a.shape).astype(np.float32)
-    beta = np.where(u <= 0.5, (2 * u) ** (1.0 / (n + 1.0)),
-                    (1.0 / (2.0 * (1.0 - u))) ** (1.0 / (n + 1.0))).astype(np.float32)
-    child = 0.5 * ((1 + beta) * a + (1 - beta) * b)
-    return _renorm_nonneg(child.astype(np.float32))
-
-def _atomic_number(sym: str) -> int:
+    features = list(search_space.keys())
+    X_train = df_stable[features].to_numpy(dtype=np.float32)
+    n_samples = X_train.shape[0]
+    if n_samples < 2: raise ValueError("Nach Stabilitätsfilterung sind zu wenige Trainingsdaten übrig.")
+    T = min(max(2, n_prototypes), n_samples)
+    k = min(max(0, k_neighbors), T - 1)
+    
+    scaler = StandardScaler().fit(X_train); Xs = scaler.transform(X_train).astype(np.float32)
+    
+    Xs_gpu = cc.h2d(Xs)
     try:
-        return int(m_element(sym).atomic_number)
-    except Exception:
-        return 999
-
-def _build_knn_neighbors(vocab: list[str], k: int) -> np.ndarray:
-    """
-    Baue k-NN über Ordnungszahlen (stetig & reproduzierbar).
-    Ergebnisform: (D,k) int32, jeder Knoten hat k Nachbarn.
-    """
-    D = len(vocab)
-    Z = np.array([_atomic_number(s) for s in vocab], dtype=np.int32)
-    neigh = np.zeros((D, max(1, k)), dtype=np.int32)
-    for i in range(D):
-        dz = np.abs(Z - Z[i])
-        dz[i] = 10_000
-        idx = np.argsort(dz)[:k]
-        neigh[i, :len(idx)] = idx.astype(np.int32)
-        if len(idx) < k:
-            extra = []
-            t = 0
-            while len(idx) + len(extra) < k:
-                extra.append((i + 1 + t) % D)
-                t += 1
-            neigh[i, :] = np.concatenate([idx, np.array(extra[:k - len(idx)], dtype=np.int32)])
-    return neigh.astype(np.int32)
-
-# ---- VQE-Fitness-Helfer -----------------------------------------------------
-
-def _props_norm_from_pool_preds(pred_matrix: np.ndarray,
-                                valid_names: Sequence[str]) -> list[dict[str, float]]:
-    """
-    pred_matrix: (N, M_valid), Spaltennamen = valid_names
-    Rückgabe: Liste von {name: normierter_wert}
-    """
-    P = pred_matrix.astype(np.float32, copy=False)
-    # Spaltenweise auf 0..1 normalisieren
-    for j in range(P.shape[1]):
-        col = P[:, j]
-        lo, hi = float(np.nanmin(col)), float(np.nanmax(col))
-        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-            P[:, j] = 0.0
+        if use_gpu_kmeans and cc.has_assign and cc.has_segsum and cc.has_proupd:
+            prototypes_scaled = gpu_kmeans_full(cc, Xs_gpu, *Xs.shape, T)
         else:
-            P[:, j] = (col - lo) / (hi - lo + 1e-8)
-    out: list[dict[str, float]] = []
-    for i in range(P.shape[0]):
-        out.append({valid_names[j]: float(P[i, j]) for j in range(P.shape[1])})
-    return out
+            prototypes_scaled = Xs[np.random.default_rng(42).choice(n_samples, size=T, replace=False)]
+    finally:
+        cc.free(Xs_gpu)
 
+    if k > 0: sim_matrix = cc.pairwise_similarity(prototypes_scaled); np.fill_diagonal(sim_matrix, -np.inf); neighbor_indices = np.argsort(sim_matrix, axis=1)[:, -k:]
+    else: neighbor_indices = np.zeros((T, 0), dtype=np.int32)
 
-def _make_terms_from_props(props_norm: dict[str, float], objectives: dict[str, float], num_qubits: int) -> list[PauliZTerm]:
-    return _ising_terms_from_objectives(props_norm, objectives, num_qubits)
+    final_assign = KMeans(n_clusters=T, init=prototypes_scaled, n_init=1).fit(Xs).labels_
+    surrogates = {}
+    
+    # --- SCHRITT 2: Trainiere das Modell NUR auf die Bandlücke ---
+    obj = 'band_gap'
+    if obj not in df_stable.columns:
+         raise ValueError("Spalte 'band_gap' nicht in den gefilterten Daten gefunden.")
 
-def _vec_hash(v: np.ndarray, ndigits: int = 4) -> tuple:
-    """
-    Stabiler Cache-Key für Kompositionsvektoren.
-    Wichtig: NumPy verwendet 'decimals' statt 'ndigits'.
-    """
-    v32 = v.astype(np.float32, copy=False)
-    return tuple(np.round(v32, decimals=int(ndigits)))
+    y = df_stable[obj].to_numpy()
+    valid_y = y[np.isfinite(y)]
+    global_mean = np.mean(valid_y) if valid_y.size > 0 else 0.0
+    proto_vals = np.array([np.mean(y[final_assign==i][np.isfinite(y[final_assign==i])]) if np.any(final_assign==i) else global_mean for i in range(T)], dtype=np.float32)
+    surrogates[obj] = MPGModel(prototypes_scaled, proto_vals, neighbor_indices, scaler)
+    
+    return surrogates
 
-# ---- GA Scoring -------------------------------------------------------------
+def predict_with_mpg(cc: CipherCore, model: MPGModel, X_pred: np.ndarray, sim_steps, diffusion, decay) -> np.ndarray:
+    T, k = model.prototypes.shape[0], model.neighbor_indices.shape[1]
+    Xs = model.scaler.transform(X_pred)
+    sims = cc.cross_similarity_batched(Xs, model.prototypes)
+    
+    if k == 0 or not cc.has_mycel: return model.prototype_properties[np.argmax(sims, axis=1)]
+        
+    cc.mycel_init(T, k); cc.mycel_set_active_T(T); cc.mycel_set_neighbors(model.neighbor_indices)
+    cc.mycel_set_params(diffusion, decay, np.ones(1, dtype=np.float32))
+    
+    preds, buf = np.zeros(X_pred.shape[0]), np.zeros(T*k)
+    for i in range(X_pred.shape[0]):
+        cc.mycel_reinforce(np.zeros(T)); cc.mycel_diffuse_decay(); cc.mycel_diffuse_decay()
+        imp = _adaptive_softmax_row(sims[i,:])
+        cc.mycel_reinforce(imp); [cc.mycel_diffuse_decay() for _ in range(sim_steps)]
+        nodes = cc.mycel_read(buf).reshape((T,k)).sum(axis=1)
+        s = nodes.sum()
+        preds[i] = np.dot(nodes/s, model.prototype_properties) if s > 1e-9 else model.prototype_properties[np.argmax(imp)]
+    return preds
 
-def score_candidates(cc: CipherCore,
-                     sur_map: dict[str, Surrogate],
-                     X: np.ndarray,
-                     objectives: Sequence[str],
-                     weights: Sequence[float]
-                     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
-    """
-    Rückgabe:
-      norm_score (N,), raw_score (N,), pred_matrix P (N,M_valid), valid_names (M_valid)
-    """
-    preds: list[np.ndarray] = []
-    valid_names: list[str] = []
+# FINALE, KORREKTE VERSION von score_formulations
+def score_formulations(pool: np.ndarray, predictions: Dict, objectives: Dict, search_space: Dict) -> Tuple[np.ndarray, np.ndarray]:
+    # Erstelle ein umfassendes Dictionary mit allen Werten, die für die Bewertung relevant sind
+    all_values = predictions.copy()
+    
+    # Füge die "Gene" aus dem Kandidaten-Pool hinzu, die auch Ziele sein könnten
+    search_space_keys = list(search_space.keys())
+    for col_name in objectives:
+        if col_name in search_space_keys and col_name not in all_values:
+            col_index = search_space_keys.index(col_name)
+            all_values[col_name] = pool[:, col_index]
 
-    w = np.asarray(weights if weights else np.ones(len(objectives), dtype=np.float32), dtype=np.float32)
-    if w.size != len(objectives):
-        w = np.ones((len(objectives),), dtype=np.float32)
-    w = w / (float(w.sum()) + 1e-8)
+    # Standard-Berechnung des gewichteten Roh-Scores
+    obj_keys = [k for k in objectives if k in all_values]
+    if not obj_keys: return np.array([]), np.array([])
+    
+    weights = np.array([objectives[k] for k in obj_keys], dtype=np.float32)
+    P = np.stack([all_values[key] for key in obj_keys], axis=1)
+    raw_score = np.sum(P * (weights / (np.sum(np.abs(weights)) + 1e-8)), axis=1)
 
-    valid_idx: list[int] = []
-    for i, obj in enumerate(objectives):
-        if obj not in sur_map:
-            continue
-        p = predict_scalar_gpu(cc, sur_map[obj], X)
-        if not np.isfinite(p).any():
-            continue
-        preds.append(p.astype(np.float32))
-        valid_idx.append(i)
-        valid_names.append(obj)
+    # Normalisiere den Score, um ihn zwischen 0 und 1 zu skalieren
+    valid = np.isfinite(raw_score)
+    if not np.any(valid): return np.zeros_like(raw_score), raw_score
+    
+    lo, hi = np.min(raw_score[valid]), np.max(raw_score[valid])
+    
+    if (hi - lo) < 1e-9:
+        return np.ones_like(raw_score) * 0.5, raw_score
 
-    if not preds:
-        N = X.shape[0]
-        return (np.zeros(N, dtype=np.float32),
-                np.zeros(N, dtype=np.float32),
-                np.zeros((N, 0), dtype=np.float32),
-                [])
+    norm_score = (raw_score - lo) / (hi - lo)
+    norm_score[~valid] = 0.0
+    
+    return np.clip(norm_score, 0, 1).astype(np.float32), raw_score.astype(np.float32)
 
-    P = np.stack(preds, axis=1).astype(np.float32)  # (N, M_valid)
-
-    w_eff = w[valid_idx]
-    w_eff = w_eff / (float(w_eff.sum()) + 1e-8)
-
-    raw = (P @ w_eff).astype(np.float32)
-    lo, hi = float(np.nanmin(raw)), float(np.nanmax(raw))
-    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-        norm = np.zeros_like(raw, dtype=np.float32)
-    else:
-        norm = (raw - lo) / (hi - lo + 1e-8)
-
-    return norm, raw, P, valid_names
-
-
-# ---- Basis-Evolution --------------------------------------------------------
-
-def search_new_material(
+def mycelial_guided_evolution(
     *,
-    dll_path: str,
-    gpu_index: int,
-    dataset: str = "dft_3d",
-    objectives: Sequence[str] = ("bandgap",),
-    weights: Sequence[float] | None = None,
-    population: int = 128,
-    steps: int = 60,
-    vocab_size: int = 32,
-    max_elements: int = 4,
-    num_qubits: int = 4,
-    cc: CipherCore | None = None,
-) -> tuple[list[str], pd.DataFrame, dict]:
-    """
-    Baseline-GA ohne Myzel-Guidance.
-    PATCH: Schreibt pro Generation ein Log in meta['gen_history'].
-    """
+    dll_path: str, gpu_index: int, source_type: str, data_source_arg: str | Dict,
+    mp_api_key: str | None, mp_column_map: ColumnMap | None,
+    search_space: Dict[str, Tuple[float, float]], objectives: Dict[str, float],
+    population: int, steps: int, n_prototypes: int = 64,
+    mycel_guidance_strength: float,
+    mycel_decay: float, mycel_diffusion: float, mycel_k_neighbors: int,
+    **kwargs
+) -> tuple[pd.DataFrame, dict]:
+    
     t0 = time.perf_counter()
-    df = load_jarvis_dataframe(dataset)
-    vocab = build_vocab(df, max_elems=vocab_size)
-    X0 = np.vstack([fraction_features(f, vocab) for f in df["formula"]]).astype(np.float32)
-    if X0.shape[0] < 100:
-        raise ValueError(f"Zu wenige valide Einträge (N={X0.shape[0]}).")
-
-    obj_list = list(objectives)
-    col_map: dict[str, str] = {}
-    for obj in obj_list:
-        lo = obj.lower()
-        if lo == "bandgap":
-            col_map[obj] = "mbj_bandgap" if "mbj_bandgap" in df.columns else "bandgap"
-        elif lo == "formation_energy":
-            col_map[obj] = "formation_energy_peratom" if "formation_energy_peratom" in df.columns else "formation_energy"
-        else:
-            col_map[obj] = obj
-        if col_map[obj] not in df.columns:
-            raise ValueError(f"Zielspalte '{obj}' nicht gefunden (versuchte '{col_map[obj]}').")
-
-    df_targets = df[["formula"]].copy()
-    for obj in obj_list:
-        df_targets[obj] = df[col_map[obj]]
-    sur_map = safe_train_surrogate_map(df_targets, vocab, obj_list)
-
-    own_cc = False
-    if cc is None:
-        cc = CipherCore(dll_path, gpu_index=gpu_index)
-        own_cc = True
-
-    rng = np.random.default_rng(42)
-    D = len(vocab)
-    pool = rng.dirichlet(np.ones(D, dtype=np.float32), size=population).astype(np.float32)
-
-    def _limit_k(vec: np.ndarray, k: int) -> np.ndarray:
-        if k <= 0 or np.count_nonzero(vec) <= k:
-            return vec
-        idx = np.argsort(vec)[-k:]
-        out = np.zeros_like(vec, dtype=np.float32); out[idx] = vec[idx]
-        return _renorm_nonneg(out)
-
-    gen_history: list[dict] = []
-    global_best_norm = -np.inf
-    global_best_vec: np.ndarray | None = None
-
-    for g in range(steps):
-        norm_score, raw_score, _ = score_candidates(cc, sur_map, pool, obj_list, list(weights or []))
-
-        # --- PATCH: Generation-Metriken loggen
-        gen_entry = {
-            "gen": int(g + 1),
-            "best_raw": float(np.max(raw_score)),
-            "mean_raw": float(np.mean(raw_score)),
-            "std_raw": float(np.std(raw_score)),
-            "best_norm": float(np.max(norm_score)),
-            "mean_norm": float(np.mean(norm_score)),
-            "std_norm": float(np.std(norm_score)),
-            # baseline: kein Myzel/VQE
-            "pheromone_mean": None,
-            "vqe_eval": 0,
-            "vqe_cache_size": 0,
-        }
-        gen_history.append(gen_entry)
-
-        if gen_entry["best_norm"] > global_best_norm:
-            global_best_norm = gen_entry["best_norm"]
-            global_best_vec = pool[int(np.argmax(norm_score))].copy()
-
-        elite_n = max(1, int(round(0.25 * population)))
-        elite_idx = np.argsort(norm_score)[-elite_n:]
-        elites = pool[elite_idx].copy()
-        parents = pool[np.argsort(norm_score)][-max(elite_n * 4, population):]
-
-        children: list[np.ndarray] = []
-        while len(children) < (population - elite_n):
-            i, j = rng.integers(0, len(parents), size=2)
-            child = crossover_sbx(parents[i], parents[j], n=2.0)
-            child = mutate_vec(child, sigma=0.05, strategy="gaussian")
-            child = _limit_k(child, max_elements)
-            children.append(child)
-        pool = np.vstack([elites] + children)
-
-        print(f"[Gen {g + 1:02d}] best_norm={gen_entry['best_norm']:.6f}  mean_norm={gen_entry['mean_norm']:.6f}")
-
-    # Kandidaten → Formeln
-    final_norm, final_raw, _ = score_candidates(cc, sur_map, pool, obj_list, list(weights or []))
-    top_idx = np.argsort(final_norm)[-20:]
-    candidates: list[np.ndarray] = []
-    if global_best_vec is not None:
-        candidates.append(global_best_vec)
-    for i in top_idx:
-        x = pool[i]
-        if not any(np.allclose(x, y, atol=1e-4) for y in candidates):
-            candidates.append(x)
-    if not candidates:
-        candidates.append(pool[int(np.argmax(final_norm))])
-
-    def vec_to_formula(v: np.ndarray, thr: float = 0.05) -> str:
-        parts = [(vocab[i], float(v[i])) for i in range(len(vocab)) if v[i] >= thr]
-        if not parts:
-            j = int(np.argmax(v))
-            parts = [(vocab[j], float(v[j]))]
-        fracs = np.array([p[1] for p in parts], dtype=np.float64)
-        fracs = fracs / float(np.min(fracs))
-        nums = np.rint(fracs / 0.25).astype(int)
-        nums[nums < 1] = 1
-        return "".join([f"{el}{'' if n == 1 else n}" for (el, _), n in zip(parts, nums)])
-
-    formulas = [vec_to_formula(v) for v in candidates]
-    Xcand = np.vstack(candidates).astype(np.float32)
-
-    pred_cols: dict[str, np.ndarray] = {}
-    for obj in obj_list:
-        pred_cols[f"pred_{obj}"] = predict_scalar_gpu(cc, sur_map[obj], Xcand)
-
-    w = np.asarray(weights if weights else np.ones(len(obj_list), dtype=np.float32), dtype=np.float32)
-    w = (w / (float(w.sum()) + 1e-8)).astype(np.float32)
-    P = np.stack([pred_cols[f"pred_{o}"] for o in obj_list], axis=1).astype(np.float32)
-    final_raw_score = (P @ w).astype(np.float32)
-
-    table = pd.DataFrame({
-        "formula_suggested": formulas,
-        "score": final_raw_score,
-        **{k: v for k, v in pred_cols.items()},
-    }).sort_values("score", ascending=False).reset_index(drop=True)
-
-    meta = {
-        "objectives": obj_list,
-        "weights": w.tolist(),
-        "runtime_s": time.perf_counter() - t0,
-        "gpu": f"index {gpu_index}",
-        "population": int(population),
-        "steps": int(steps),
-        "vocab_size": int(vocab_size),
-        "max_elements": int(max_elements),
-        "gen_history": gen_history,               # <-- PATCH: Historie verfügbar
-        "pheromone_history": [],                  # baseline: leer
-        "mycel_params": None,
-        "vqe_fitness": {"enabled": False},
-    }
-    if own_cc:
-        del cc
-    return formulas, table, meta
-
-
-# ============================================================================
-# C) Myzel-Variante (mit optionaler VQE-Fitness)
-# ============================================================================
-
-def mycelial_quantum_evolution(
-    *,
-    dll_path: str,
-    gpu_index: int,
-    dataset: str = "dft_3d",
-    objectives: Sequence[str] = ("bandgap",),
-    weights: Sequence[float] | None = None,
-    population: int = 128,
-    steps: int = 60,
-    vocab_size: int = 32,
-    max_elements: int = 4,
-    num_qubits: int = 4,
-    # Myzel
-    mycel_guidance_strength: float = 0.3,
-    mycel_decay: float = 0.05,
-    mycel_diffusion: float = 0.02,
-    mycel_k_neighbors: int = 4,
-    mycel_topk_bias: int | None = None,
-    # VQE-Fitness
-    use_vqe_fitness: bool = True,
-    vqe_weight: float = 0.35,
-    vqe_elite_k: int = 8,
-    vqe_num_qubits: int = 6,
-    vqe_layers: int = 2,
-) -> tuple[list[str], pd.DataFrame, dict]:
-    """
-    GA mit Myzel-Guidance + optionaler VQE-Fitness.
-    PATCH: Schreibt pro Generation ein Log in meta['gen_history'] inkl. pheromone_mean & vqe_eval.
-    """
-    t0 = time.perf_counter()
-    # 1) Daten & Vokabular
-    df = load_jarvis_dataframe(dataset)
-    vocab = build_vocab(df, max_elems=vocab_size)
-    D = len(vocab)
-
-    # 2) Surrogate
-    obj_list = list(objectives)
-    col_map: dict[str, str] = {}
-    for obj in obj_list:
-        lo = obj.lower()
-        if lo == "bandgap":
-            col_map[obj] = "mbj_bandgap" if "mbj_bandgap" in df.columns else "bandgap"
-        elif lo == "formation_energy":
-            col_map[obj] = "formation_energy_peratom" if "formation_energy_peratom" in df.columns else "formation_energy"
-        else:
-            col_map[obj] = obj
-        if col_map[obj] not in df.columns:
-            raise ValueError(f"Zielspalte '{obj}' nicht gefunden (versuchte '{col_map[obj]}').")
-    df_targets = df[["formula"]].copy()
-    for obj in obj_list:
-        df_targets[obj] = df[col_map[obj]]
-    sur_map = safe_train_surrogate_map(df_targets, vocab, obj_list)
-
-    # 3) CipherCore + Myzel
+    
+    df_train = load_dataframe(source_type, data_source_arg, mp_api_key, mp_column_map)
+    
     cc = CipherCore(dll_path, gpu_index=gpu_index)
-    if not cc.has_mycel:
-        raise NotImplementedError("DLL enthält keine Myzel-Funktionen (subqg_*).")
+    try:
+        mpg_surrogates = train_mpg_surrogates(cc, df_train, search_space, list(objectives.keys()), n_prototypes=n_prototypes, k_neighbors=mycel_k_neighbors)
+        
+        D = len(search_space)
+        rng = np.random.default_rng(42)
+        mins = np.array([v[0] for v in search_space.values()], dtype=np.float32)
+        maxs = np.array([v[1] for v in search_space.values()], dtype=np.float32)
+        pool = rng.uniform(mins, maxs, size=(population, D)).astype(np.float32)
 
-    k = int(max(1, mycel_k_neighbors))
-    cc.mycel_init(nodes=D, k_neighbors=k, layers=1)
-    neigh_idx = _build_knn_neighbors(vocab, k=k)
-    cc.mycel_set_neighbors(neigh_idx)
+        gen_history = []
+        k_search = min(mycel_k_neighbors, D - 1) if D > 1 else 0
+        
+        print("\n--- Starte evolutionäre Suche ---")
+        for g in range(steps):
+            predictions = {obj: predict_with_mpg(cc, model, pool, sim_steps=3, diffusion=mycel_diffusion, decay=mycel_decay) for obj, model in mpg_surrogates.items()}
+            norm_score, raw_score = score_formulations(pool, predictions, objectives, search_space)
+            
+            if cc.has_mycel and k_search > 0:
+                cc.mycel_init(D, k_search)
+                cc.mycel_set_active_T(D)
+                cc.mycel_set_neighbors(np.array([[(i + j + 1) % D for j in range(k_search)] for i in range(D)], dtype=np.int32))
+                cc.mycel_set_params(mycel_diffusion, mycel_decay, np.ones(1, dtype=np.float32))
 
-    gains = np.array([float(np.clip(mycel_guidance_strength, 0.0, 1.0))], dtype=np.float32)
-    cc.mycel_set_params(diffusion=float(mycel_diffusion), decay=float(mycel_decay), gains=gains)
+            elite_n = max(2, int(0.2 * population))
+            elite_indices = np.argsort(raw_score)[-elite_n:]
+            elites = pool[elite_indices].copy()
+            
+            if cc.has_mycel and k_search > 0:
+                reinforce_vec_norm = (np.mean(elites, axis=0) - mins) / (maxs - mins + 1e-9)
+                cc.mycel_reinforce(reinforce_vec_norm * mycel_guidance_strength)
+                cc.mycel_diffuse_decay()
+                pher_nodes = cc.mycel_read(np.zeros(D * k_search, dtype=np.float32)).reshape((D, k_search)).sum(axis=1)
+            else:
+                pher_nodes = np.zeros(D, dtype=np.float32)
 
-    # 4) GA-Setup
-    rng = np.random.default_rng(42)
-    population = int(population)
-    steps = int(steps)
-    max_elements = int(max_elements)
-    pool = rng.dirichlet(np.ones(D, dtype=np.float32), size=population).astype(np.float32)
+            children = []
+            parent_weights = norm_score + 1e-6
+            if parent_weights.sum() < 1e-9: parent_weights = None 
+            else: parent_weights /= parent_weights.sum()
+            
+            while len(children) < population - elite_n:
+                p1_idx, p2_idx = rng.choice(np.arange(population), 2, replace=False, p=parent_weights)
+                child = crossover_blend(pool[p1_idx], pool[p2_idx])
+                t = g / max(1, steps-1); mu = (1-t)*0.15 + t*0.03
+                child = mutate_gaussian(child, search_space, strength=float(mu))
+                child_norm = (child - mins)/(maxs - mins + 1e-9)
+                guided_norm = _apply_guidance(child_norm, pher_nodes, mycel_guidance_strength)
+                child = guided_norm*(maxs - mins) + mins
+                children.append(_clip_to_space(child, search_space))
+            
+            pool = np.vstack([elites] + children)
 
-    def _limit_k(vec: np.ndarray, kmax: int) -> np.ndarray:
-        if kmax <= 0 or np.count_nonzero(vec) <= kmax:
-            return vec
-        idx = np.argsort(vec)[-kmax:]
-        out = np.zeros_like(vec, dtype=np.float32); out[idx] = vec[idx]
-        return _renorm_nonneg(out)
+            mean_norm_valid = np.mean(norm_score[norm_score > 0]) if np.any(norm_score > 0) else 0.0
+            gen_history.append({"gen": g + 1, "best_norm": np.max(norm_score), "mean_norm": mean_norm_valid, "pheromone_mean": pher_nodes.mean()})
+            print(f"[Gen {g+1:02d}] Bester Score: {gen_history[-1]['best_norm']:.4f}, Pheromon: {gen_history[-1]['pheromone_mean']:.6f}")
+        
+        final_predictions = {obj: predict_with_mpg(cc, model, pool, sim_steps=3, diffusion=mycel_diffusion, decay=mycel_decay) for obj, model in mpg_surrogates.items()}
+        final_norm, _ = score_formulations(pool, final_predictions, objectives, search_space)
+        
+        result_df = pd.DataFrame(pool, columns=list(search_space.keys()))
+        result_df["score"] = final_norm
+        for prop, values in final_predictions.items(): result_df[f'pred_{prop}'] = values
+        
+        result_df = result_df.sort_values("score", ascending=False).reset_index(drop=True)
+        meta = { "runtime_s": time.perf_counter() - t0, "gen_history": gen_history, "objectives": objectives }
 
-    gen_history: list[dict] = []
-    pher_history_mean: list[float] = []
-
-    # KORREKTUR: Puffer für Kanten-Pheromone erstellen (Größe D * K)
-    pher_edge_buf = np.zeros((D * k,), dtype=np.float32) 
-    pher_node_buf = np.zeros((D,), dtype=np.float32) # Puffer für die berechneten Knoten-Pheromone
-
-    global_best_comb = -np.inf
-    global_best_vec: np.ndarray | None = None
-
-    # VQE-Cache: Hash(vec) -> Energie
-    vqe_cache: dict[tuple, float] = {}
-
-    # 5) Schleife
-    for g in range(steps):
-        # Surrogat-Bewertung
-        norm_score, raw_score, P_pred, valid_names = score_candidates(cc, sur_map, pool, obj_list, list(weights or []))
-        elite_n = max(1, int(round(0.25 * population)))
-        elite_idx = np.argsort(norm_score)[-elite_n:]
-        elites = pool[elite_idx].copy()
-
-        vqe_eval_count = 0
-
-        # 3) Optional: VQE-Fitness in kombinierte Fitness mischen
-        if use_vqe_fitness and cc.has_vqe and vqe_weight > 0.0:
-            props_norm_list = _props_norm_from_pool_preds(P_pred.copy(), valid_names)
-            k_eval = int(max(1, min(vqe_elite_k, elites.shape[0])))
-            elite_eval_idx = elite_idx[-k_eval:]
-            energies = np.full(pool.shape[0], np.nan, dtype=np.float32)
-
-            for idx in elite_eval_idx:
-                vec = pool[idx]
-                hkey = _vec_hash(vec, ndigits=4)
-                if hkey in vqe_cache:
-                    energies[idx] = vqe_cache[hkey]
-                else:
-                    props_norm = props_norm_list[idx] if idx < len(props_norm_list) else {}
-                    terms = _make_terms_from_props(props_norm, {k: float(v) for k, v in zip(obj_list, (weights or [1.0]*len(obj_list)))}, vqe_num_qubits)
-                    if terms:
-                        seed = float(np.dot(vec, np.arange(vec.size, dtype=np.float32)) % 1.0)
-                        params = _default_vqe_params(vqe_num_qubits, vqe_layers, seed=seed)
-                        try:
-                            e = cc.vqe_energy(vqe_num_qubits, vqe_layers, params, terms)
-                            energies[idx] = e
-                            vqe_cache[hkey] = float(e)
-                            vqe_eval_count += 1
-                        except Exception as _e:
-                            pass
-
-            eval_mask = np.isfinite(energies)
-            if np.any(eval_mask):
-                e_eval = energies[eval_mask]
-                e_norm = (e_eval - float(np.min(e_eval))) / (float(np.max(e_eval) - np.min(e_eval)) + 1e-8)
-                vqe_score = np.zeros_like(energies, dtype=np.float32); vqe_score[eval_mask] = 1.0 - e_norm.astype(np.float32)
-                comb = norm_score.copy()
-                comb[eval_mask] = (1.0 - float(vqe_weight)) * norm_score[eval_mask] + float(vqe_weight) * vqe_score[eval_mask]
-                norm_score = comb
-                # Eliten ggf. neu bestimmen
-                elite_idx = np.argsort(norm_score)[-elite_n:]
-                elites = pool[elite_idx].copy()
-
-        # 4) Pheromon-Verstärkung JETZT berechnen und anwenden
-        elite_scores = norm_score[elite_idx]
-        es = elite_scores - float(np.min(elite_scores))
-        if np.allclose(es.sum(), 0.0):
-            # fallback: gleichmäßige Verstärkung der Eliten
-            es = np.ones_like(elite_scores, dtype=np.float32)
-        es = es / float(es.sum())
-        reinforce = np.average(elites, axis=0, weights=es).astype(np.float32)
-        cc.mycel_reinforce(reinforce)
-        cc.mycel_diffuse_decay()
-
-        # 5) JETZT Pheromon messen (nach Update)
-        if 'pher_buf' not in locals():
-            pher_edges_raw = cc.mycel_read(layer=0, out_buf=pher_edge_buf)
-        pher = pher_edges_raw.reshape((D, k)).sum(axis=1)
-        pher_history_mean.append(float(np.mean(pher)))
-
-        # 6) Kinder mit Pheromon-Guidance erzeugen
-        parents = pool[np.argsort(norm_score)][-max(elite_n * 4, population):]
-        children: list[np.ndarray] = []
-        while len(children) < (population - elite_n):
-            i, j = np.random.randint(0, parents.shape[0], size=2)
-            pa, pb = parents[i], parents[j]
-            child = crossover_sbx(pa, pb, n=2.0)
-            child = mutate_vec(child, sigma=0.05, strategy="gaussian")
-            child = _apply_pheromone_guidance(child, pher, strength=float(mycel_guidance_strength),
-                                              topk=(int(mycel_topk_bias) if mycel_topk_bias else None))
-            child = _limit_k(child, max_elements)
-            children.append(child)
-        pool = np.vstack([elites] + children)
-
-        pher_mean = float(np.mean(pher))
-
-        # Update global best (nach ggf. kombinierter Fitness)
-        best_comb = float(np.max(norm_score))
-        if best_comb > global_best_comb:
-            global_best_comb = best_comb
-            global_best_vec = pool[int(np.argmax(norm_score))].copy()
-
-        # --- PATCH: Generation-Metriken loggen
-        gen_entry = {
-            "gen": int(g + 1),
-            "best_raw": float(np.max(raw_score)),
-            "mean_raw": float(np.mean(raw_score)),
-            "std_raw": float(np.std(raw_score)),
-            "best_norm": float(np.max(norm_score)),
-            "mean_norm": float(np.mean(norm_score)),
-            "std_norm": float(np.std(norm_score)),
-            "pheromone_mean": pher_mean,
-            "vqe_eval": int(vqe_eval_count),
-            "vqe_cache_size": int(len(vqe_cache)),
-        }
-        gen_history.append(gen_entry)
-
-        print(f"[Gen {g + 1:02d}] best={np.max(norm_score):.3f}  mean={np.mean(norm_score):.3f}  pher_mean={pher_history_mean[-1]:.6f}")
-
-    # Abschluss – Kandidaten & Tabelle
-    _final = score_candidates(cc, sur_map, pool, obj_list, list(weights or []))
-    final_norm = _final[0]
-    top_idx = np.argsort(final_norm)[-20:]
-
-    candidates: list[np.ndarray] = []
-    if global_best_vec is not None:
-        candidates.append(global_best_vec)
-    for i in top_idx:
-        x = pool[i]
-        if not any(np.allclose(x, y, atol=1e-4) for y in candidates):
-            candidates.append(x)
-    if not candidates:
-        candidates.append(pool[int(np.argmax(final_norm))])
-
-    def vec_to_formula(v: np.ndarray, thr: float = 0.05) -> str:
-        parts = [(vocab[i], float(v[i])) for i in range(len(vocab)) if v[i] >= thr]
-        if not parts:
-            j = int(np.argmax(v)); parts = [(vocab[j], float(v[j]))]
-        fracs = np.array([p[1] for p in parts], dtype=np.float64)
-        fracs = fracs / float(np.min(fracs))
-        nums = np.rint(fracs / 0.25).astype(int); nums[nums < 1] = 1
-        return "".join([f"{el}{'' if n == 1 else n}" for (el, _), n in zip(parts, nums)])
-
-    formulas = [vec_to_formula(v) for v in candidates]
-    Xcand = np.vstack(candidates).astype(np.float32)
-
-    pred_cols: dict[str, np.ndarray] = {}
-    for obj in obj_list:
-        try:
-            pred_cols[f"pred_{obj}"] = predict_scalar_gpu(cc, sur_map[obj], Xcand)
-        except KeyError:
-            pred_cols[f"pred_{obj}"] = np.full((Xcand.shape[0],), np.nan, dtype=np.float32)
-
-    # final_norm nochmal für Kandidaten extrahieren
-    cand_scores = []
-    for v in candidates:
-        # einfacher Linear-Score (ohne Re-Norm), nachvollziehbar:
-        s = 0.0
-        for (obj, w) in zip(obj_list, (weights or [1.0]*len(obj_list))):
-            pv = predict_scalar_gpu(cc, sur_map[obj], v.reshape(1,-1))[0]
-            if np.isfinite(pv):
-                s += float(w) * float(pv)
-        cand_scores.append(s)
-    cand_scores = np.asarray(cand_scores, dtype=np.float32)
-
-    # auf 0..1 bringen für Anzeige
-    if np.nanmax(cand_scores) > np.nanmin(cand_scores):
-        show_scores = (cand_scores - np.nanmin(cand_scores)) / (np.nanmax(cand_scores) - np.nanmin(cand_scores))
-    else:
-        show_scores = np.zeros_like(cand_scores, dtype=np.float32)
-
-    table = pd.DataFrame({
-        "formula_suggested": formulas,
-        "score": show_scores,
-        **{k: v for k, v in pred_cols.items()},
-    }).sort_values("score", ascending=False).reset_index(drop=True)
-
-    meta = {
-        "objectives": obj_list,
-        "weights": list(weights or [1.0] * len(obj_list)),
-        "runtime_s": time.perf_counter() - t0,
-        "gpu": f"index {gpu_index}",
-        "population": population,
-        "steps": steps,
-        "vocab_size": vocab_size,
-        "max_elements": max_elements,
-        "gen_history": gen_history,
-        "pheromone_history": [float(x) for x in pher_history_mean],
-        "mycel_params": {
-            "guidance": float(mycel_guidance_strength),
-            "decay": float(mycel_decay),
-            "diffusion": float(mycel_diffusion),
-            "k_neighbors": int(mycel_k_neighbors),
-            "topk_bias": (int(mycel_topk_bias) if mycel_topk_bias else None),
-        },
-        "vqe_fitness": {
-            "enabled": bool(use_vqe_fitness),
-            "weight": float(vqe_weight),
-            "elite_k": int(vqe_elite_k),
-            "num_qubits": int(vqe_num_qubits),
-            "layers": int(vqe_layers),
-            "cache_size": len(vqe_cache),
-        }
-    }
-    return formulas, table, meta
-
-
-# ============================================================================
-# D) Guidance/Helper
-# ============================================================================
-
-def _apply_pheromone_guidance(vec: np.ndarray, pher: np.ndarray, strength: float, topk: int | None = None) -> np.ndarray:
-    if strength <= 0.0:
-        return vec
-    p = np.maximum(pher.astype(np.float32), 0.0)
-    if topk and topk < p.size:
-        idx = np.argsort(p)[-topk:]
-        mask = np.zeros_like(p); mask[idx] = p[idx]
-        p = mask
-    τ = 0.2
-    s = np.exp((p - p.max()) / max(1e-6, τ)).astype(np.float32)
-    s = s / (float(s.sum()) + 1e-8)
-    guided = (1.0 - strength) * vec + strength * s
-    return _renorm_nonneg(guided)
+        return result_df.head(50), meta
+    finally:
+        del cc
