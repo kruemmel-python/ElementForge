@@ -1,7 +1,3 @@
-
-
-
-
 # Forge Studio: Industrial Formulation Engine
 
 [![Lizenz: MIT](https://img.shields.io/badge/Lizenz-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -10,83 +6,96 @@
 
 **GPU-beschleunigte Rezepturoptimierung für die Materialwissenschaft und Industrie mittels eines evolutionären Algorithmus, geleitet durch ein Mycelial Prototype Graph (MPG) Surrogatmodell.**
 
+Forge Studio ist ein Framework zur Entdeckung und Optimierung von industriellen Rezepturen und neuen Materialien. Anstatt auf langwierige Laborexperimente zu setzen, nutzt dieses Projekt einen datengesteuerten Ansatz, um den Suchraum potenzieller Materialkombinationen effizient zu durchsuchen. Der Workflow reicht von der abstrakten Definition von Zielen über die KI-gestützte Suche bis hin zur Generierung konkreter, umsetzbarer Laborrezepte.
+
+
+
 ---
 
 ## Inhaltsverzeichnis
 
-1.  [Über das Projekt](#über-das-projekt)
-2.  [Kernkonzepte](#kernkonzepte)
+1.  [Über das Projekt](#1-über-das-projekt)
+2.  [Architektur und Kernkonzepte](#2-architektur-und-kernkonzepte)
+    *   [Systemarchitektur](#systemarchitektur)
     *   [CipherCore OpenCL Treiber (DLL)](#ciphercore-opencl-treiber-dll)
     *   [Mycelial Prototype Graph (MPG) Modell](#mycelial-prototype-graph-mpg-modell)
     *   [Evolutionärer Algorithmus](#evolutionärer-algorithmus)
-3.  [Architektur](#architektur)
-4.  [Installation und Einrichtung](#installation-und-einrichtung)
+    *   [Materials Project Datenkonnektor](#materials-project-datenkonnektor)
+3.  [Installation und Einrichtung](#3-installation-und-einrichtung)
     *   [Voraussetzungen](#voraussetzungen)
-    *   [Schritt-für-Schritt-Anleitung](#schritt-für-schritt-anleitung)
-5.  [Anwendung und Nutzung](#anwendung-und-nutzung)
+    *   [Installationsanleitung](#installationsanleitung)
+4.  [Benutzerhandbuch](#4-benutzerhandbuch)
     *   [Starten der Anwendung](#starten-der-anwendung)
-    *   [Konfiguration eines Optimierungslaufs](#konfiguration-eines-optimierungslaufs)
-6.  [Fallstudie: Von Fehlern zur erfolgreichen Optimierung](#fallstudie-von-fehlern-zur-erfolgreichen-optimierung)
-    *   [Phase 1: Technische Fehlerbehebung](#phase-1-technische-fehlerbehebung)
-    *   [Phase 2: Das "kollabierte Modell"](#phase-2-das-kollabierte-modell)
-    *   [Phase 3: Verfeinerung der Bewertungslogik](#phase-3-verfeinerung-der-bewertungslogik)
-    *   [Phase 4: Der Durchbruch durch "Constrained Optimization"](#phase-4-der-durchbruch-durch-constrained-optimization)
-    *   [Finale Testergebnisse](#finale-testergebnisse)
-7.  [Glossar](#glossar)
-8.  [Mitwirken](#mitwirken)
-9.  [Lizenz](#lizenz)
+    *   [Tab B: Evolutionäre Formulierung entwerfen](#tab-b-evolutionäre-formulierung-entwerfen)
+    *   [Tab C: Diagnostik der Suche](#tab-c-diagnostik-der-suche)
+    *   [Tab D: Rezept-Generator](#tab-d-rezept-generator)
+5.  [Fallstudie & Testergebnisse](#5-fallstudie--testergebnisse)
+    *   [Die Herausforderung: Konvergenz zu suboptimalen Ergebnissen](#die-herausforderung-konvergenz-zu-suboptimalen-ergebnissen)
+    *   [Der Durchbruch: "Constrained Optimization"](#der-durchbruch-constrained-optimization)
+    *   [Beispielhafte Ergebnisse](#beispielhafte-ergebnisse)
+6.  [Anhang](#6-anhang)
+    *   [Projektdateien](#projektdateien)
+    *   [Glossar](#glossar)
+    *   [Lizenz](#lizenz)
 
-## Über das Projekt
+---
 
-**Forge Studio** ist ein Framework zur Entdeckung und Optimierung von industriellen Rezepturen und neuen Materialien. Anstatt auf langwierige und teure Laborexperimente zu setzen, nutzt dieses Projekt einen datengesteuerten Ansatz, um den Suchraum potenzieller Materialkombinationen effizient zu durchsuchen.
+## 1. Über das Projekt
 
-Das Herzstück des Systems ist eine Kombination aus drei Schlüsseltechnologien:
+Das Problem, das Forge Studio löst, ist die zeitaufwändige und oft empirische Suche nach neuen Materialien oder industriellen Rezepturen mit gewünschten Eigenschaften. Durch die Kombination von GPU-Beschleunigung, Surrogatmodellierung und evolutionären Algorithmen bietet es einen datengesteuerten, intelligenten Optimierungsprozess, der den gesamten Entdeckungszyklus beschleunigt.
 
-1.  **GPU-Beschleunigung:** Ein maßgeschneiderter C-Treiber (`CipherCore_OpenCl.dll`), der über OpenCL direkt mit der Grafikkarte kommuniziert, um massive Parallelberechnungen durchzuführen. Dies beschleunigt den Optimierungsprozess um Größenordnungen im Vergleich zu reinen CPU-Implementierungen.
-2.  **Surrogatmodellierung (MPG):** Ein "Mycelial Prototype Graph"-Modell wird auf existierenden Daten trainiert, um die Eigenschaften neuer, hypothetischer Materialien blitzschnell vorherzusagen, ohne dass eine teure Simulation oder ein Labortest erforderlich ist.
-3.  **Evolutionäre Algorithmen:** Inspiriert von der biologischen Evolution, erzeugt und verbessert ein genetischer Algorithmus Generationen von "Rezepturen", um die besten Kandidaten zu finden, die den vom Benutzer definierten Zielen (z.B. hohe Stabilität, große Bandlücke) entsprechen.
+**Hauptmerkmale:**
 
-## Kernkonzepte
+*   **Vollständiger Workflow:** Von der abstrakten Zieldefinition bis zum konkreten Laborrezept.
+*   **Hohe Performance:** Ein maßgeschneiderter C-Treiber (`CipherCore_OpenCl.dll`) nutzt OpenCL für massive Parallelberechnungen auf der GPU.
+*   **Intelligente Suche:** Ein genetischer Algorithmus, geleitet durch ein Mycelial Prototype Graph (MPG) Surrogatmodell, erkundet effizient den Lösungsraum.
+*   **Robuste Datenanbindung:** Ein flexibler Konnektor bindet die Materials Project API an, inklusive Fallback-Mechanismen und umfassender Datenbereinigung.
+*   **Interaktive Benutzeroberfläche:** Eine mit Streamlit erstellte Web-App ermöglicht die intuitive Steuerung aller Parameter und die Visualisierung der Ergebnisse.
 
-### CipherCore OpenCL Treiber (DLL)
+## 2. Architektur und Kernkonzepte
 
-Die `CipherCore_OpenCl.dll` (oder `.so`/`.dylib` auf Linux/macOS) ist das Fundament der hohen Performance von Forge Studio. Diese in C geschriebene Bibliothek:
+### Systemarchitektur
 
-*   **Initialisiert die GPU:** Sie erkennt OpenCL-fähige Grafikkarten und stellt eine Verbindung her.
-*   **Kompiliert Kernel:** Spezialisierte C-Programme (Kernel) für Aufgaben wie Matrixmultiplikation, Clustering und Simulation werden zur Laufzeit für die spezifische GPU-Architektur kompiliert.
-*   **Verwaltet den Speicher:** Sie kümmert sich um das Zuweisen von Speicher auf der GPU und das schnelle Kopieren von Daten zwischen CPU und GPU.
-*   **Stellt eine C-API bereit:** Python kommuniziert über das `ctypes`-Modul mit dieser Bibliothek, um Hochleistungsberechnungen anzustoßen.
+Das Projekt ist in drei klare Schichten unterteilt, die eine saubere Trennung von Darstellung, Logik und Berechnung gewährleisten:
 
-### Mycelial Prototype Graph (MPG) Modell
-
-Das MPG-Modell ist ein Surrogatmodell, das lernt, die Ergebnisse teurer Experimente oder Simulationen zu approximieren.
-
-*   **Prototype Graph:** Das Modell lernt eine Reihe von "Prototypen" – ideale Repräsentanten für bestimmte Materialcluster (z.B. "stabile Oxide mit kleiner Dichte"). Wenn eine neue Rezeptur bewertet wird, wird sie mit diesen Prototypen verglichen. Ihre Eigenschaften werden dann aus einer gewichteten Kombination der Eigenschaften der nächstgelegenen Prototypen abgeleitet.
-*   **Mycelial Guidance:** Der "myzeliale" Aspekt bezieht sich auf das Pheromon-System, das den evolutionären Algorithmus leitet. Wie ein Pilzmyzel, das Nährstoffe im Boden findet, hinterlässt der Algorithmus "Pheromonspuren" in den vielversprechenden Bereichen des Suchraums. Die `Guidance-Stärke` steuert, wie stark sich neue Generationen von diesen Spuren anziehen lassen.
-
-### Evolutionärer Algorithmus
-
-Der Optimierungsprozess ist ein genetischer Algorithmus:
-
-1.  **Initialisierung:** Eine zufällige "Population" von Kandidaten-Rezepturen wird erstellt.
-2.  **Bewertung (Fitness):** Das MPG-Modell sagt die Eigenschaften jedes Kandidaten voraus. Eine Bewertungsfunktion (`score_formulations`) berechnet einen "Fitness-Score" basierend auf den vom Benutzer gesetzten Zielen.
-3.  **Selektion:** Die besten Kandidaten ("Eliten") werden für die nächste Generation ausgewählt.
-4.  **Reproduktion:** Neue Kandidaten ("Kinder") werden durch `Crossover` (Kombination zweier Eltern) und `Mutation` (zufällige kleine Änderungen) erzeugt.
-5.  **Wiederholung:** Der Prozess wird über Hunderte von Generationen wiederholt, wobei sich die Population schrittweise in Richtung optimaler Lösungen entwickelt.
-
-## Architektur
-
-Das Projekt ist in drei klare Schichten unterteilt:
-
-1.  **Präsentationsschicht (`forge_studio_ui.py`):** Eine interaktive Web-Benutzeroberfläche, die mit Streamlit erstellt wurde. Sie ermöglicht die Konfiguration der Optimierung und die Visualisierung der Ergebnisse.
-2.  **Logikschicht (`forge_backend.py`):** Das Python-Herzstück. Es implementiert den evolutionären Algorithmus, steuert den Trainingsprozess des MPG-Modells und fungiert als Brücke zur C-Bibliothek.
-3.  **Compute-Schicht (`CipherCore_OpenCl.dll`):** Die in C geschriebene High-Performance-Bibliothek, die alle rechenintensiven Aufgaben auf der GPU ausführt.
+1.  **Präsentationsschicht (`forge_studio_ui.py`):** Eine interaktive Web-UI (Streamlit).
+2.  **Logikschicht (`forge_backend.py`):** Das Python-Herzstück, das den evolutionären Algorithmus und das Modelltraining steuert.
+3.  **Compute-Schicht (`CipherCore_OpenCl.dll`):** Die in C geschriebene High-Performance-Bibliothek für alle rechenintensiven GPU-Aufgaben.
 
 ```
 [ UI (Streamlit) ] <--> [ Python Backend (Logik) ] <--> [ CipherCore DLL (C/OpenCL) ] <--> [ GPU ]
 ```
 
-## Installation und Einrichtung
+### CipherCore OpenCL Treiber (DLL)
+
+Die `CipherCore_OpenCl.dll` ist das Fundament der hohen Performance. Diese in C geschriebene Bibliothek ist verantwortlich für:
+*   **GPU-Initialisierung:** Erkennt und verbindet sich mit OpenCL-fähigen Grafikkarten.
+*   **Kernel-Kompilierung:** Kompiliert spezialisierte C-Programme (Kernel) zur Laufzeit für die spezifische GPU-Architektur.
+*   **Speicherverwaltung:** Allokiert GPU-Speicher und managt den Datentransfer zwischen CPU und GPU.
+*   **C-API:** Stellt eine Schnittstelle bereit, die von Python über `ctypes` aufgerufen wird, um GPU-Berechnungen anzustoßen.
+
+### Mycelial Prototype Graph (MPG) Modell
+
+Das MPG-Modell ist ein Surrogatmodell, das lernt, die Ergebnisse teurer Experimente oder Simulationen zu approximieren.
+*   **Prototype Graph:** Das Modell lernt eine Reihe von "Prototypen" – ideale Repräsentanten für bestimmte Materialcluster. Die Eigenschaften neuer Kandidaten werden durch Vergleich mit diesen Prototypen vorhergesagt.
+*   **Mycelial Guidance:** Ein Pheromon-System leitet den evolutionären Algorithmus. Wie ein Pilzmyzel hinterlässt der Algorithmus "Spuren" in vielversprechenden Bereichen des Suchraums.
+
+### Evolutionärer Algorithmus
+
+Der Optimierungsprozess folgt den Prinzipien der natürlichen Selektion:
+1.  **Initialisierung:** Erzeugung einer zufälligen "Population" von Kandidaten.
+2.  **Bewertung (Fitness):** Das MPG-Modell sagt die Eigenschaften jedes Kandidaten voraus, und eine Funktion berechnet einen Fitness-Score basierend auf den Zielen.
+3.  **Selektion & Reproduktion:** Die besten Kandidaten überleben und erzeugen durch Kreuzung (`crossover`) und Mutation neue Nachkommen.
+4.  **Wiederholung:** Dieser Zyklus wird über viele Generationen wiederholt, wodurch sich die Population schrittweise in Richtung optimaler Lösungen entwickelt.
+
+### Materials Project Datenkonnektor
+
+Das Modul `materials_mp_connector.py` ist ein flexibler und robuster Datenkonnektor für die Materials Project API.
+*   **Dual-Mode-Fähigkeit:** Kann wahlweise den offiziellen Python-Client (`mp-api`) oder einen generischen REST-Ansatz (`requests`) verwenden, inklusive automatischem Fallback.
+*   **Umfassende Datenbereinigung:** Führt Spaltenumbenennung, Typkonvertierung, intelligente Handhabung fehlender Werte und Imputation durch, um ein sauberes, sofort nutzbares Pandas DataFrame zu liefern.
+*   **Flexibilität:** Die `ColumnMap`-Struktur ermöglicht eine einfache Anpassung der abgerufenen Daten an die Anwendungsanforderungen.
+
+## 3. Installation und Einrichtung
 
 ### Voraussetzungen
 
@@ -95,7 +104,7 @@ Das Projekt ist in drei klare Schichten unterteilt:
 *   Aktuelle Treiber für eine OpenCL 1.2+ fähige GPU (NVIDIA, AMD, Intel)
 *   Git zur Versionskontrolle
 
-### Schritt-für-Schritt-Anleitung
+### Installationsanleitung
 
 1.  **Repository klonen:**
     ```bash
@@ -105,11 +114,11 @@ Das Projekt ist in drei klare Schichten unterteilt:
 
 2.  **Python-Abhängigkeiten installieren:**
     ```bash
-    pip install -r requirements.txt
+    pip install streamlit pandas numpy scikit-learn mp-api requests
     ```
 
 3.  **CipherCore DLL kompilieren:**
-    Navigieren Sie in das Verzeichnis, das den C-Quellcode (`opencl_driver.c`) enthält.
+    Navigieren Sie in das Verzeichnis mit der C-Quelldatei `opencl_driver.c`.
 
     *   **Unter Linux/macOS (mit GCC/Clang):**
         ```bash
@@ -117,92 +126,86 @@ Das Projekt ist in drei klare Schichten unterteilt:
         gcc -shared -o CipherCore_OpenCl.so -fPIC opencl_driver.c -lOpenCL
         ```
 
-    *   **Unter Windows (mit MSVC in einer Developer Command Prompt):**
+    *   **Unter Windows (mit MSVC in einer "Developer Command Prompt"):**
         ```bash
-        # 'path\to\opencl\sdk' anpassen
+        # 'path\to\opencl\sdk' an den Installationsort Ihres OpenCL SDKs anpassen
         cl /LD opencl_driver.c -I"path\to\opencl\sdk\include" "path\to\opencl\sdk\lib\OpenCL.lib" /FeCipherCore_OpenCl.dll
-        ```    > **Wichtig:** Stellen Sie sicher, dass die kompilierte DLL (`CipherCore_OpenCl.dll` oder `.so`) im Hauptverzeichnis des Projekts liegt, damit sie von `autodetect_dll()` gefunden wird.
+        ```
+    > **Wichtig:** Stellen Sie sicher, dass die kompilierte DLL/SO-Datei im Hauptverzeichnis des Projekts liegt, damit sie von der automatischen Erkennung gefunden wird.
 
-4.  **Anwendung starten:**
+## 4. Benutzerhandbuch
+
+### Starten der Anwendung
+1.  Öffnen Sie ein Terminal im Projektverzeichnis.
+2.  Führen Sie den Befehl aus:
     ```bash
     streamlit run forge_studio_ui.py
     ```
+3.  Die Anwendung wird in Ihrem Standard-Webbrowser geöffnet.
 
-## Anwendung und Nutzung
+### Tab B: Evolutionäre Formulierung entwerfen
+Dies ist der Haupt-Tab, um eine Optimierung zu starten.
 
-### Starten der Anwendung
+1.  **Anwendungsproblem auswählen:** Wählen Sie z.B. "Stabile Halbleiter".
+2.  **Ziele definieren:** Wählen Sie die zu optimierenden Eigenschaften (z.B. "Bandlücke", "Bildungsenergie") und deren Gewichte (positiv = maximieren, negativ = minimieren).
+3.  **Datenquelle & Parameter:**
+    *   Geben Sie Ihren **Materials Project API-Key** ein.
+    *   Geben Sie eine **MP Query** an (z.B. `*-O` für alle Oxide, um eine große, vielfältige Trainingsbasis zu schaffen).
+    *   Stellen Sie **Population** (z.B. `512`), **Generationen** (z.B. `200`) und **Anzahl Prototypen** (z.B. `256` oder höher für mehr Modelldetail) ein.
+4.  **Myzel-Parameter:** Passen Sie die `Guidance-Stärke` an, um die Balance zwischen Erkundung (niedrige Werte) und Ausnutzung (hohe Werte) zu steuern.
+5.  **Synthese starten:** Klicken Sie auf den Button, um den GPU-beschleunigten Lauf zu starten. Nach Abschluss werden die Ergebnisse in einer Tabelle angezeigt und können als CSV heruntergeladen werden.
 
-Nach dem Start öffnet sich automatisch ein Browserfenster mit der Forge Studio UI unter `http://localhost:8501`.
+### Tab C: Diagnostik der Suche
+Dieser Tab gibt Einblicke in den abgeschlossenen Lauf.
+*   **Letzte Laufzeit:** Zeigt die Gesamtdauer der Berechnung.
+*   **Fitness-Verlauf:** Visualisiert den Anstieg des besten Scores über die Generationen – ein Indikator für eine erfolgreiche Optimierung.
+*   **Myzel-Aktivität:** Zeigt die durchschnittliche Pheromon-Stärke.
 
-### Konfiguration eines Optimierungslaufs
+### Tab D: Rezept-Generator
+Dieser Tab erscheint, sobald Ergebnisse aus Tab B vorliegen. Er übersetzt die abstrakten Ergebnisse in konkrete Materialien.
+1.  **Konfigurieren:** Stellen Sie ein, wie viele Kandidaten pro Ziel gesucht und für wie viele Top-Kandidaten Rezepte erstellt werden sollen.
+2.  **Mapping starten:** Klicken Sie auf den Button. Das System durchsucht das Materials Project nach realen Materialien, die Ihren optimierten Eigenschaften entsprechen.
+3.  **Ergebnisse analysieren:**
+    *   **Vorgeschlagene Materialien:** Zeigt eine Liste realer Materialien für jede Ihrer Top-Lösungen an.
+    *   **Konsens-Ranking:** Eine aggregierte Liste der Materialien, die am häufigsten und besten zu Ihren Zielen passen.
+    *   **Generierte Labor-Rezepte:** Detaillierte, schrittweise Anleitungen zur Synthese der Top-Konsens-Kandidaten, inklusive benötigter Ausgangsstoffe und deren Massen.
 
-1.  **Problem auswählen:** Wählen Sie ein vordefiniertes Optimierungsproblem aus, z.B. "Stabile Halbleiter (Materials Project)".
-2.  **Ziele definieren:** Wählen Sie die Materialeigenschaften aus, die Sie optimieren möchten (z.B. `Bandlücke`, `Bildungsenergie`). Weisen Sie Gewichte zu: positive Werte für Maximierung, negative für Minimierung.
-3.  **Datenquelle konfigurieren:** Geben Sie für das Materials Project einen gültigen API-Schlüssel und eine chemische Systemabfrage (z.B. `*-O` für alle Oxide) an.
-4.  **Simulations-Parameter einstellen:**
-    *   **Population:** Anzahl der Kandidaten pro Generation (empfohlen: 512+).
-    *   **Generationen:** Dauer der Suche (empfohlen: 100+).
-    *   **Anzahl Prototypen:** Komplexität des MPG-Modells (empfohlen: 256+ für komplexe Probleme).
-5.  **Myzel-Parameter anpassen:**
-    *   **Guidance-Stärke:** Steuert die Balance zwischen Erkundung (niedrige Werte) und Ausnutzung (hohe Werte). Ein guter Startwert ist `0.1-0.2`.
-6.  **Synthese starten:** Klicken Sie auf "Synthese starten", um den GPU-beschleunigten Lauf zu beginnen. Die Ergebnisse werden live in der Konsole und nach Abschluss in der UI angezeigt.
+## 5. Fallstudie & Testergebnisse
 
-## Fallstudie: Von Fehlern zur erfolgreichen Optimierung
+Die Entwicklung von Forge Studio war ein iterativer Prozess, der typische Herausforderungen im Machine Learning aufzeigte.
 
-Die Entwicklung dieses Projekts war eine iterative Reise, die typische Herausforderungen bei der Kombination von Hardware-Beschleunigung und maschinellem Lernen widerspiegelt.
+### Die Herausforderung: Konvergenz zu suboptimalen Ergebnissen
+Erste erfolgreiche Läufe zeigten ein "kollabiertes" Modell: Der Score sprang sofort auf den Maximalwert, und die Vorhersagen waren für alle Kandidaten identisch. Das Modell war nicht komplex genug und die Bewertungsfunktion zu einfach, was den Algorithmus daran hinderte, den Lösungsraum wirklich zu erkunden.
 
-#### Phase 1: Technische Fehlerbehebung
+### Der Durchbruch: "Constrained Optimization"
+Die finale, erfolgreiche Strategie war eine Vereinfachung der Aufgabe für die KI:
+1.  **Daten filtern:** Das Modell wird ausschließlich auf **nachweislich stabilen Materialien** trainiert (`energy_above_hull <= 0.02 eV/Atom`).
+2.  **Ziel fokussieren:** Das Modell wird darauf trainiert, **nur eine primäre Eigenschaft** (z.B. `band_gap`) vorherzusagen.
+3.  **Score neu definieren:** Die Bewertungsfunktion kombiniert die **Modellvorhersage** (z.B. `pred_band_gap`) mit den **direkten "Genen"** des Kandidaten (z.B. `formation_energy_per_atom`), um einen echten Kompromiss zu bewerten.
 
-Die ersten Hürden waren rein technischer Natur:
-*   **DLL-Ladefehler:** Sicherstellen, dass die C-Bibliothek korrekt kompiliert und vom Python-Skript gefunden wird.
-*   **Python-Fehler:** Behebung von `NameError`, `TypeError` und `SyntaxError` aufgrund fehlender Imports, falscher Funktionsaufrufe und Tippfehlern in der evolutionären Logik.
+### Beispielhafte Ergebnisse
+Mit dieser Methode zeigt die Anwendung das gewünschte Verhalten: Der Fitness-Verlauf im Diagnostik-Tab demonstriert einen klaren Lernprozess, bei dem der Score über die Generationen hinweg ansteigt. Der Rezept-Generator liefert am Ende eine Liste konkreter, vielversprechender Materialien wie `Al2O3`, `ZrO2`, `HfO2` und `MgAl2O4` und berechnet sogar die stöchiometrisch korrekten Mengen der Ausgangsstoffe für eine Laborsynthese.
 
-#### Phase 2: Das "kollabierte Modell"
+## 6. Anhang
 
-Nachdem die technischen Fehler behoben waren, zeigten die ersten Läufe ein trügerisches Bild: Der Score sprang sofort auf 1.0, aber die Vorhersagen waren für alle Kandidaten identisch.
-*   **Problem:** Das MPG-Modell war "unterangepasst". Es lernte nur den Durchschnittswert der Trainingsdaten und war nicht komplex genug, um auf Variationen in den Eingabedaten zu reagieren.
-*   **Lösung:** Erhöhung der Trainingsdaten durch breitere Abfragen (`*-O`) und Hinzufügen aussagekräftigerer Features (`formation_energy_per_atom`).
+### Projektdateien
+*   `forge_studio_ui.py`: Implementiert die Streamlit-Benutzeroberfläche.
+*   `forge_backend.py`: Enthält die Kernlogik des evolutionären Algorithmus und des MPG-Modells.
+*   `materials_mp_connector.py`: Stellt die Verbindung zur Materials Project API her.
+*   `recipe_mapper.py`: Übersetzt optimierte Eigenschaften in reale Materialien und Laborrezepte.
+*   `CipherCore_OpenCl.dll` / `opencl_driver.c`: Die GPU-Compute-Bibliothek und ihr Quellcode.
 
-#### Phase 3: Verfeinerung der Bewertungslogik
-
-Die nächste Herausforderung war eine zu "flache" oder "steile" Bewertungslandschaft.
-*   **Problem:** Eine harte "Straf-Klippe" in der `score_formulations`-Funktion (z.B. Score = -999 bei `e_above_hull > 0.1`) machte es dem Algorithmus unmöglich, sich schrittweise zu verbessern.
-*   **Lösung:** Umwandlung der harten Strafen in "sanfte Rampen", die eine kontinuierliche Bewertung ermöglichen.
-
-#### Phase 4: Der Durchbruch durch "Constrained Optimization"
-
-Selbst mit sanften Strafen war das Problem für die KI noch zu komplex. Der entscheidende Durchbruch kam durch eine Vereinfachung der Aufgabe:
-1.  **Daten filtern:** Das Modell wurde ausschließlich auf **stabilen Materialien** trainiert.
-2.  **Ziel fokussieren:** Das Modell lernte, **nur die Bandlücke vorherzusagen**.
-3.  **Score anpassen:** Die Bewertungsfunktion wurde so umgebaut, dass sie die vorhergesagte Bandlücke mit den "Genen" des Kandidaten (wie `formation_energy_per_atom`) kombiniert.
-
-#### Finale Testergebnisse
-
-Mit dieser finalen Architektur zeigt das System das gewünschte Verhalten einer echten Optimierung. Der Diagnostik-Tab zeigt einen **Fitness-Verlauf**, bei dem der Score niedrig beginnt und sich über die Generationen hinweg einem Optimum annähert. Dies beweist, dass der Algorithmus aktiv den Suchraum erkundet und lernt.
-
-
-> *Finale Testergebnisse: Der "Fitness-Verlauf" zeigt, wie der beste Score (blaue Linie) über die Generationen ansteigt – ein klares Zeichen für eine erfolgreiche Optimierung.*
-
-## Glossar
-
-*   **API-Key:** Ein geheimer Schlüssel zur Authentifizierung bei einem Web-Dienst wie dem Materials Project.
-*   **Bandlücke (Band Gap):** In der Festkörperphysik die Energie, die benötigt wird, um ein Elektron in einen leitenden Zustand anzuregen. Materialien mit einer Bandlücke sind Halbleiter oder Isolatoren.
-*   **DLL (Dynamic Link Library):** Eine unter Windows kompilierte Bibliothek mit C-Funktionen, die von anderen Programmen (hier: Python) aufgerufen werden kann.
-*   **Energie über der Hull (Energy Above Hull):** Ein Maß für die thermodynamische Stabilität eines Materials. Ein Wert von 0 eV/Atom bedeutet, dass das Material stabil ist. Positive Werte deuten auf Instabilität hin.
-*   **Evolutionärer Algorithmus:** Eine Optimierungstechnik, die von der biologischen Evolution inspiriert ist (Selektion, Kreuzung, Mutation).
-*   **Feature:** Eine einzelne messbare Eigenschaft oder ein Merkmal, das als Eingabe für ein Machine-Learning-Modell dient (z.B. `density`).
-*   **Kernel (OpenCL):** Ein kleines, in C geschriebenes Programm, das zur Ausführung auf den vielen Recheneinheiten einer GPU konzipiert ist.
+### Glossar
+*   **API (Application Programming Interface):** Eine Softwareschnittstelle zur Interaktion.
+*   **Bandlücke (Band Gap):** Ein Maß für die Energie, die benötigt wird, um ein Elektron in einem Material leitfähig zu machen.
+*   **Energie über der Hull (Energy Above Hull):** Ein Maß für die thermodynamische Stabilität eines Materials (Ziel: ≤ 0).
+*   **Evolutionärer Algorithmus:** Eine von der biologischen Evolution inspirierte Optimierungsmethode.
+*   **Feature:** Eine Eingabevariable für ein Machine-Learning-Modell.
+*   **Kernel (OpenCL):** Ein kleines Programm, das zur Ausführung auf einer GPU geschrieben wurde.
 *   **MPG (Mycelial Prototype Graph):** Der Name des in diesem Projekt verwendeten Surrogatmodells.
-*   **OpenCL (Open Computing Language):** Ein offener Standard zur Programmierung von heterogenen Systemen, insbesondere zur Ausführung von Code auf GPUs.
-*   **Pheromon:** Im Kontext dieses Projekts eine Metapher für eine "Erinnerungsspur", die der Algorithmus in vielversprechenden Bereichen des Suchraums hinterlässt.
-*   **Prototyp:** Ein repräsentativer Datenpunkt, der einen Cluster oder eine "Region" im Datenraum repräsentiert. Das MPG-Modell nutzt eine Reihe von Prototypen, um sein "Wissen" zu strukturieren.
-*   **Streamlit:** Ein Python-Framework zur schnellen Erstellung von interaktiven Web-Anwendungen für Data-Science-Projekte.
-*   **Surrogatmodell:** Ein Machine-Learning-Modell, das als schneller "Ersatz" (Surrogat) für eine langsame oder teure Funktion (z.B. eine physikalische Simulation) dient.
+*   **OpenCL:** Ein offener Standard für die parallele Programmierung auf heterogenen Systemen (wie GPUs).
+*   **Surrogatmodell:** Ein schnelles Machine-Learning-Modell, das als Ersatz für eine langsame Simulation dient.
+*   **Paginierung:** Das Aufteilen großer Datenmengen in kleinere "Seiten" für den Abruf über eine API.
 
-## Mitwirken
-
-Beiträge sind willkommen! Bitte öffnen Sie ein Issue, um Fehler zu melden oder neue Features vorzuschlagen.
-
-## Lizenz
-
-Dieses Projekt ist unter der MIT-Lizenz lizenziert. Weitere Informationen finden Sie in der `LICENSE`-Datei.
+### Lizenz
+Dieses Projekt ist unter der **MIT-Lizenz** lizenziert. Weitere Informationen finden Sie in der `LICENSE`-Datei.
