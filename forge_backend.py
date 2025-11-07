@@ -1,14 +1,13 @@
-#!/usr-bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-forge_backend.py (Version 5.1 - Constrained Optimization)
-=========================================================
-- Implementiert einen vollständigen K-Means-Algorithmus auf der GPU unter
-  Verwendung der nativen Treiberfunktionen (Assignment, Segmented Sum, Update Step).
-- Nutzt Batched Matrix Multiplication für eine speichereffiziente und schnelle
-  Berechnung der Cross-Similarity im MPG-Modell.
-- Führt eine "Constrained Optimization" durch: Das Modell wird nur auf stabile
-  Materialien trainiert und optimiert primär die Bandlücke.
+forge_backend.py (Version 5.2 - Chemical Feature Engineering)
+============================================================
+- Implementiert einen vollständigen K-Means-Algorithmus auf der GPU.
+- Nutzt Batched Matrix Multiplication für eine speichereffiziente Berechnung.
+- Führt "Constrained Optimization" durch: Training nur auf stabilen Materialien.
+- NEU: Implementiert Feature Engineering, um chemische Informationen ('chemsys')
+  als One-Hot-Encoding für das Modelltraining nutzbar zu machen.
 """
 from __future__ import annotations
 
@@ -28,10 +27,6 @@ from sklearn.cluster import KMeans
 from materials_mp_connector import MaterialsProjectConnector, ColumnMap
 
 def autodetect_dll() -> str:
-    """
-    Versucht, die kompilierte Treiberbibliothek an gängigen Orten zu finden.
-    Gibt den Pfad als String oder einen Standardnamen zurück, falls sie nicht gefunden wird.
-    """
     if sys.platform == "win32":
         lib_name = "CipherCore_OpenCl.dll"
     elif sys.platform == "linux":
@@ -41,14 +36,7 @@ def autodetect_dll() -> str:
     else:
         return "CipherCore_OpenCl.dll"
 
-    search_paths = [
-        Path.cwd(),
-        Path(__file__).parent,
-        Path.cwd() / "build",
-        Path.cwd() / "Release",
-        Path.cwd() / "Debug",
-    ]
-
+    search_paths = [Path.cwd(), Path(__file__).parent, Path.cwd() / "build", Path.cwd() / "Release", Path.cwd() / "Debug"]
     for path in search_paths:
         candidate = path / lib_name
         if candidate.exists() and candidate.is_file():
@@ -135,7 +123,7 @@ class CipherCore:
     def cross_similarity_batched(self, A: np.ndarray, B: np.ndarray, rows_per_batch: int = 1024) -> np.ndarray:
         A, B = np.ascontiguousarray(A, dtype=np.float32), np.ascontiguousarray(B, dtype=np.float32)
         N, D = A.shape; T, D2 = B.shape
-        if D != D2: raise ValueError("D-Mismatch")
+        if D != D2: raise ValueError(f"Dimensions-Mismatch für Cross-Similarity: A.shape[1] ({D}) != B.shape[1] ({D2})")
         if not self.has_matmul or N <= rows_per_batch: return (A @ B.T).astype(np.float32, copy=False)
 
         nb = (N + rows_per_batch - 1) // rows_per_batch; M = rows_per_batch
@@ -226,12 +214,15 @@ def gpu_kmeans_full(cc: CipherCore, Xs_gpu: C.c_void_p, N: int, D: int, T: int, 
 # ============================================================================
 @dataclass(slots=True)
 class MPGModel:
-    prototypes: np.ndarray; prototype_properties: np.ndarray; neighbor_indices: np.ndarray
+    prototypes: np.ndarray
+    prototype_properties: np.ndarray
+    neighbor_indices: np.ndarray
     scaler: StandardScaler
+    # NEU: Speichere die Liste der chemischen Features für die Vorhersage
+    all_elements: List[str]
+    physical_features: List[str]
 
-# ============================================================================
-# ===  EVOLUTIONÄRE OPERATOREN                                            ===
-# ============================================================================
+# ... (crossover, mutate, etc. bleiben unverändert) ...
 def crossover_blend(p1: np.ndarray, p2: np.ndarray, alpha: float = 0.5) -> np.ndarray:
     return alpha * p1 + (1.0 - alpha) * p2
 
@@ -239,6 +230,7 @@ def mutate_gaussian(ind: np.ndarray, space: Dict[str, Tuple[float, float]], stre
     mutated = ind.copy()
     rng = np.random.default_rng()
     for i, (key, (low, high)) in enumerate(space.items()):
+        if key == 'chemsys': continue # chemsys nicht mutieren
         scale = (high - low) * strength
         mutated[i] += rng.normal(0, scale)
     return mutated
@@ -247,6 +239,9 @@ def _clip_to_space(ind: np.ndarray, space: Dict[str, Tuple[float, float]]) -> np
     clipped = ind.copy()
     i = 0
     for key, (low, high) in space.items():
+        if key == 'chemsys':
+            i += 1
+            continue
         clipped[i] = np.clip(clipped[i], low, high)
         i += 1
     return clipped
@@ -264,20 +259,32 @@ def _adaptive_softmax_row(x: np.ndarray) -> np.ndarray:
     if std < 1e-9: return np.full(x.shape, 1.0/x.size, dtype=np.float32)
     z = (x - float(np.mean(x))) / std; e = np.exp(z); return e / e.sum()
 
-# NEUE, FINALE VERSION von train_mpg_surrogates
+# NEUE, INTELLIGENTE VERSION von train_mpg_surrogates
 def train_mpg_surrogates(cc: CipherCore, df: pd.DataFrame, search_space, obj_list, n_prototypes=64, k_neighbors=8, use_gpu_kmeans=True) -> Dict[str, MPGModel]:
-    # --- SCHRITT 1: Filtere die Trainingsdaten auf stabile Materialien ---
-    # Wir behalten nur Materialien, die sehr stabil sind (e_above_hull <= 0.02 eV/Atom)
-    # 0.02 ist eine kleine Toleranz für Berechnungsungenauigkeiten.
     df_stable = df[df['e_above_hull'] <= 0.02].copy().reset_index(drop=True)
-    
     print(f"[Info] Nach Stabilitätsfilter: {len(df_stable)} von {len(df)} Materialien verbleiben für das Training.")
+    
     if len(df_stable) < n_prototypes:
         print(f"[Warnung] Nach Filterung sind zu wenige Datenpunkte ({len(df_stable)}) übrig. Reduziere Prototypen auf {len(df_stable)}.")
         n_prototypes = max(2, len(df_stable))
 
-    features = list(search_space.keys())
-    X_train = df_stable[features].to_numpy(dtype=np.float32)
+    print("[Info] Erzeuge chemische Features aus 'chemsys' (One-Hot-Encoding)...")
+    all_elements = sorted(list(set(el for chemsys in df_stable['chemsys'] for el in chemsys.split('-'))))
+    
+    chem_features = []
+    for chemsys in df_stable['chemsys']:
+        elements_in_row = set(chemsys.split('-'))
+        chem_features.append([1.0 if el in elements_in_row else 0.0 for el in all_elements])
+    
+    chem_features_df = pd.DataFrame(chem_features, columns=[f"has_{el}" for el in all_elements])
+
+    physical_features = [f for f in search_space.keys() if f in df_stable.columns]
+    X_physical = df_stable[physical_features].to_numpy(dtype=np.float32)
+    X_chem = chem_features_df.to_numpy(dtype=np.float32)
+    X_train = np.hstack([X_physical, X_chem])
+    
+    print(f"[Info] Training mit {X_train.shape[1]} Features insgesamt ({X_physical.shape[1]} physikalische, {X_chem.shape[1]} chemische).")
+
     n_samples = X_train.shape[0]
     if n_samples < 2: raise ValueError("Nach Stabilitätsfilterung sind zu wenige Trainingsdaten übrig.")
     T = min(max(2, n_prototypes), n_samples)
@@ -300,7 +307,6 @@ def train_mpg_surrogates(cc: CipherCore, df: pd.DataFrame, search_space, obj_lis
     final_assign = KMeans(n_clusters=T, init=prototypes_scaled, n_init=1).fit(Xs).labels_
     surrogates = {}
     
-    # --- SCHRITT 2: Trainiere das Modell NUR auf die Bandlücke ---
     obj = 'band_gap'
     if obj not in df_stable.columns:
          raise ValueError("Spalte 'band_gap' nicht in den gefilterten Daten gefunden.")
@@ -309,13 +315,18 @@ def train_mpg_surrogates(cc: CipherCore, df: pd.DataFrame, search_space, obj_lis
     valid_y = y[np.isfinite(y)]
     global_mean = np.mean(valid_y) if valid_y.size > 0 else 0.0
     proto_vals = np.array([np.mean(y[final_assign==i][np.isfinite(y[final_assign==i])]) if np.any(final_assign==i) else global_mean for i in range(T)], dtype=np.float32)
-    surrogates[obj] = MPGModel(prototypes_scaled, proto_vals, neighbor_indices, scaler)
+    surrogates[obj] = MPGModel(prototypes_scaled, proto_vals, neighbor_indices, scaler, all_elements, physical_features)
     
     return surrogates
 
 def predict_with_mpg(cc: CipherCore, model: MPGModel, X_pred: np.ndarray, sim_steps, diffusion, decay) -> np.ndarray:
+    # NEU: Erzeuge chemische Features für die Vorhersagedaten
+    # Annahme: X_pred enthält nur die physikalischen Features
+    chem_features_pred = np.zeros((X_pred.shape[0], len(model.all_elements)), dtype=np.float32)
+    X_pred_full = np.hstack([X_pred, chem_features_pred])
+
     T, k = model.prototypes.shape[0], model.neighbor_indices.shape[1]
-    Xs = model.scaler.transform(X_pred)
+    Xs = model.scaler.transform(X_pred_full)
     sims = cc.cross_similarity_batched(Xs, model.prototypes)
     
     if k == 0 or not cc.has_mycel: return model.prototype_properties[np.argmax(sims, axis=1)]
@@ -335,17 +346,13 @@ def predict_with_mpg(cc: CipherCore, model: MPGModel, X_pred: np.ndarray, sim_st
 
 # FINALE, KORREKTE VERSION von score_formulations
 def score_formulations(pool: np.ndarray, predictions: Dict, objectives: Dict, search_space: Dict) -> Tuple[np.ndarray, np.ndarray]:
-    # Erstelle ein umfassendes Dictionary mit allen Werten, die für die Bewertung relevant sind
     all_values = predictions.copy()
-    
-    # Füge die "Gene" aus dem Kandidaten-Pool hinzu, die auch Ziele sein könnten
     search_space_keys = list(search_space.keys())
     for col_name in objectives:
         if col_name in search_space_keys and col_name not in all_values:
             col_index = search_space_keys.index(col_name)
             all_values[col_name] = pool[:, col_index]
 
-    # Standard-Berechnung des gewichteten Roh-Scores
     obj_keys = [k for k in objectives if k in all_values]
     if not obj_keys: return np.array([]), np.array([])
     
@@ -353,7 +360,6 @@ def score_formulations(pool: np.ndarray, predictions: Dict, objectives: Dict, se
     P = np.stack([all_values[key] for key in obj_keys], axis=1)
     raw_score = np.sum(P * (weights / (np.sum(np.abs(weights)) + 1e-8)), axis=1)
 
-    # Normalisiere den Score, um ihn zwischen 0 und 1 zu skalieren
     valid = np.isfinite(raw_score)
     if not np.any(valid): return np.zeros_like(raw_score), raw_score
     

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-materials_mp_connector.py (v1.3 - E-Above-Hull)
-------------------------------------------------
-- Fordert 'energy_above_hull' als Standardfeld an, um das wissenschaftlich
-  relevanteste Stabilitätskriterium zu ermöglichen.
+materials_mp_connector.py (v1.3 - E-Above-Hull & Chemsys)
+---------------------------------------------------------
+- Fordert 'energy_above_hull' und 'chemsys' als Standardfelder an,
+  um Stabilitätsfilterung und chemisches Feature Engineering zu ermöglichen.
 - Behält die robuste Datenbereinigung und das Fehlerhandling bei.
 """
 from __future__ import annotations
@@ -15,7 +15,6 @@ import os
 import pandas as pd
 import numpy as np
 
-# Optionale Abhängigkeiten
 try:
     from mp_api.client import MPRester
     MP_API_AVAILABLE = True
@@ -35,26 +34,36 @@ class ColumnMap:
 
 def _rename_and_filter(df: pd.DataFrame, cmap: ColumnMap) -> pd.DataFrame:
     required_external_cols = list(cmap.features.values()) + list(cmap.targets.values())
+    
+    # Handle 'chemsys' which might not be numeric
+    is_numeric_col = {col: col != 'chemsys' for col in df.columns}
+    
     missing_cols = [col for col in required_external_cols if col not in df.columns]
     if missing_cols:
         raise KeyError(f"Die folgenden Spalten fehlen in der API-Antwort: {missing_cols}")
 
+    # Trenne Features und Targets
     feature_df = df[list(cmap.features.values())].rename(columns={v: k for k, v in cmap.features.items()})
     target_df = df[list(cmap.targets.values())].rename(columns={v: k for k, v in cmap.targets.items()})
     
     out_df = pd.concat([feature_df, target_df], axis=1)
     
+    # Konvertiere nur numerische Spalten
     for col in out_df.columns:
-        out_df[col] = pd.to_numeric(out_df[col], errors='coerce')
+        if is_numeric_col.get(cmap.features.get(col, cmap.targets.get(col)), True):
+            out_df[col] = pd.to_numeric(out_df[col], errors='coerce')
 
     out_df = out_df.replace([np.inf, -np.inf], np.nan)
     out_df = out_df.dropna(subset=list(cmap.targets.keys()), how='all').reset_index(drop=True)
+    
     for col in cmap.features.keys():
         if out_df[col].isnull().any():
-            mean_val = out_df[col].mean()
-            if pd.isna(mean_val):
-                mean_val = 0
-            out_df[col] = out_df[col].fillna(mean_val)
+            # Fülle nur numerische Spalten
+            if is_numeric_col.get(cmap.features.get(col), True):
+                mean_val = out_df[col].mean()
+                if pd.isna(mean_val):
+                    mean_val = 0
+                out_df[col] = out_df[col].fillna(mean_val)
             
     return out_df
 
@@ -89,7 +98,8 @@ class MaterialsProjectConnector:
         wanted = set(self.fields or [])
         wanted.update(self.column_map.features.values())
         wanted.update(self.column_map.targets.values())
-        wanted.update({"material_id", "formula_pretty", "chemsys", "energy_above_hull"})
+        # Stelle sicher, dass diese Felder immer angefordert werden
+        wanted.update({"material_id", "formula_pretty", "chemsys", "energy_above_hull", "formation_energy_per_atom"})
         return sorted(list(wanted))
 
     def _fetch_via_client(self, api_key: str, fields: List[str]) -> pd.DataFrame:
@@ -98,7 +108,21 @@ class MaterialsProjectConnector:
             docs = mpr.materials.summary.search(fields=fields, limit=self.max_n, **q)
         if not docs:
             raise RuntimeError("MP-Client lieferte 0 Datensätze (prüfe Filter).")
-        recs = [{k: getattr(d, k, None) for k in fields} for d in docs]
+        
+        recs = []
+        for d in docs:
+            rec = {}
+            for k in fields:
+                # Behandle verschachtelte Felder wie 'spacegroup.symbol'
+                try:
+                    val = d
+                    for part in k.split('.'):
+                        val = getattr(val, part)
+                    rec[k] = val
+                except AttributeError:
+                    rec[k] = None
+            recs.append(rec)
+            
         df = pd.DataFrame(recs)
         return _rename_and_filter(df, self.column_map)
 
@@ -121,7 +145,7 @@ class MaterialsProjectConnector:
                 detail = r.text[:300].replace("\n", " ")
                 raise requests.HTTPError(
                     f"MP-REST: {r.status_code} {r.reason}. "
-                    f"Ursachen: Falscher Parameter (z. B. 'formula'=\"Fe2O3\") oder ungültiger API-Key. "
+                    f"Ursachen: Falscher Parameter oder ungültiger API-Key. "
                     f"URL: {r.url} | Antwort: {detail}"
                 ) from http_err
 
